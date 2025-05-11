@@ -2,7 +2,8 @@
 package main
 
 import (
-	"devmux/lua"
+	"bytes"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -20,6 +21,19 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+
+	"devmux/lua"
+)
+
+const (
+	colorReset  = "\033[0m"
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorBlue   = "\033[34m"
+	colorPurple = "\033[35m"
+	colorCyan   = "\033[36m"
+	colorWhite  = "\033[37m"
 )
 
 var (
@@ -187,6 +201,136 @@ func mustParseURL(raw string) *url.URL {
 	return u
 }
 
+// loggingResponseWriter is a wrapper for http.ResponseWriter that captures the status code and size of the response
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+	size       int
+	body       *bytes.Buffer
+}
+
+// captures the status code
+func (lw *loggingResponseWriter) WriteHeader(code int) {
+	lw.statusCode = code
+	lw.ResponseWriter.WriteHeader(code)
+}
+
+// capture and count the size of the response body
+func (lw *loggingResponseWriter) Write(b []byte) (int, error) {
+	size, err := lw.ResponseWriter.Write(b)
+	lw.size += size
+	if lw.body != nil {
+		lw.body.Write(b)
+	}
+	return size, err
+}
+
+func newLoggingResponseWriter(w http.ResponseWriter) *loggingResponseWriter {
+	var buf *bytes.Buffer
+	// Verificamos o Content-Type apenas no momento da escrita
+	buf = &bytes.Buffer{}
+	return &loggingResponseWriter{
+		ResponseWriter: w,
+		statusCode:     http.StatusOK, // Default status code
+		body:           buf,
+	}
+}
+
+func formatBody(body []byte, contentType string) string {
+	if len(body) == 0 {
+		return "[Empty body]"
+	}
+
+	if strings.Contains(contentType, "text") ||
+		strings.Contains(contentType, "json") ||
+		strings.Contains(contentType, "xml") ||
+		strings.Contains(contentType, "html") {
+		return string(body)
+	}
+
+	return fmt.Sprintf("[Binary data, Content-Type: %s - Size: %v bytes]",
+		contentType,
+		len(body))
+}
+
+func captureRequestBody(r *http.Request) ([]byte, error) {
+	if r.Body == nil {
+		return nil, nil
+	}
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	return bodyBytes, nil
+}
+
+func logRequest(r *http.Request, routeKey string, target string) {
+	fmt.Printf("\n%s>> REQUEST RECEIVED%s\n",
+		colorGreen, colorReset)
+	fmt.Printf("%s>> Route:%s %s → %s\n", colorGreen, colorReset, routeKey, target)
+	fmt.Printf("%s>> Method:%s %s\n", colorGreen, colorReset, r.Method)
+	fmt.Printf("%s>> URL:%s %s%s\n", colorGreen, colorReset, r.Host, r.URL.String())
+
+	fmt.Printf("%s>> Headers:%s\n", colorGreen, colorReset)
+	for key, values := range r.Header {
+		fmt.Printf(">>   %s: %s\n", key, strings.Join(values, ", "))
+	}
+
+	bodyBytes, err := captureRequestBody(r)
+	if err != nil {
+		fmt.Printf(">>   [Error reading body: %v]\n", err)
+		return
+	}
+
+	if len(bodyBytes) > 0 {
+		contentType := r.Header.Get("Content-Type")
+		fmt.Printf("%s>> Body:%s\n", colorGreen, colorReset)
+		fmt.Printf(">>   %s\n", formatBody(bodyBytes, contentType))
+	}
+}
+
+func logResponse(w *loggingResponseWriter, duration time.Duration) {
+	fmt.Printf("\n%s<< RESPONSE%s\n",
+		colorYellow, colorReset)
+	fmt.Printf("%s<< Status:%s %d %s\n",
+		colorYellow,
+		colorReset,
+		w.statusCode,
+		http.StatusText(w.statusCode))
+	fmt.Printf("%s<< Size:%s %d bytes\n", colorYellow, colorReset, w.size)
+	fmt.Printf("%s<< Duration:%s %v\n", colorYellow, colorReset, duration)
+
+	fmt.Printf("%s<< Headers:%s\n", colorYellow, colorReset)
+	for key, values := range w.Header() {
+		fmt.Printf("<<   %s: %s\n", key, strings.Join(values, ", "))
+	}
+
+	if w.body != nil && w.body.Len() > 0 {
+		contentType := w.Header().Get("Content-Type")
+		fmt.Printf("%s<< Body:%s\n", colorYellow, colorReset)
+		fmt.Printf("<<   %s\n", formatBody(w.body.Bytes(), contentType))
+	}
+}
+
+// loggingHandler is a middleware that intercepts requests and responses for logging
+func loggingHandler(routeKey string, target string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		logRequest(r, routeKey, target)
+
+		lw := newLoggingResponseWriter(w)
+
+		next.ServeHTTP(lw, r)
+
+		duration := time.Since(start)
+		logResponse(lw, duration)
+	})
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Llongfile)
 
@@ -216,21 +360,32 @@ func main() {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seg := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
 		if len(seg) == 0 || seg[0] == "" {
+			fmt.Printf("\n%s!! ROTA NÃO ENCONTRADA%s: %s\n", colorRed, colorReset, r.URL.Path)
 			http.NotFound(w, r)
 			return
 		}
 		port, ok := routes[seg[0]]
 		if !ok {
+			fmt.Printf("\n%s!! ROTA NÃO ENCONTRADA%s: %s\n", colorRed, colorReset, seg[0])
 			http.NotFound(w, r)
 			return
 		}
+
+		routeKey := seg[0]
 		// strip first segment
 		r.URL.Path = "/" + strings.Join(seg[1:], "/")
 		target := "http://127.0.0.1:" + port
 
 		proxy := httputil.NewSingleHostReverseProxy(mustParseURL(target))
 		proxy.ErrorLog = log.Default()
-		proxy.ServeHTTP(w, r)
+
+		originalDirector := proxy.Director
+		proxy.Director = func(req *http.Request) {
+			originalDirector(req)
+		}
+
+		// Use the middleware to log the request and response
+		loggingHandler(routeKey, target, proxy).ServeHTTP(w, r)
 	})
 
 	server := http.Server{Handler: handler}
