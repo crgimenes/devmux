@@ -23,3 +23,13 @@ go.work.sum
 
 # env file
 .env
+*.lua
+draft
+.DS_Store
+.vscode
+todo.md
+devmux
+release.sh
+dist
+*.sql
+
