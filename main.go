@@ -290,52 +290,59 @@ func captureRequestBody(r *http.Request) ([]byte, error) {
 	return bodyBytes, nil
 }
 
-func logRequest(r *http.Request, routeKey string, target string) {
-	fmt.Printf("\n%s>> REQUEST RECEIVED%s\n",
-		colorGreen, colorReset)
-	fmt.Printf("%s>> Route:%s %s → %s\n", colorGreen, colorReset, routeKey, target)
-	fmt.Printf("%s>> Method:%s %s\n", colorGreen, colorReset, r.Method)
-	fmt.Printf("%s>> URL:%s %s%s\n", colorGreen, colorReset, r.Host, r.URL.String())
+// captureRequestLog formats request information and returns it as a string
+func captureRequestLog(r *http.Request, routeKey string, target string) string {
+	var sb strings.Builder
 
-	fmt.Printf("%s>> Headers:%s\n", colorGreen, colorReset)
+	sb.WriteString(fmt.Sprintf("\n%s>> REQUEST RECEIVED%s\n",
+		colorGreen, colorReset))
+	sb.WriteString(fmt.Sprintf("%s>> Route:%s %s → %s\n", colorGreen, colorReset, routeKey, target))
+	sb.WriteString(fmt.Sprintf("%s>> Method:%s %s\n", colorGreen, colorReset, r.Method))
+	sb.WriteString(fmt.Sprintf("%s>> URL:%s %s%s\n", colorGreen, colorReset, r.Host, r.URL.String()))
+
+	sb.WriteString(fmt.Sprintf("%s>> Headers:%s\n", colorGreen, colorReset))
 	for key, values := range r.Header {
-		fmt.Printf(">>   %s: %s\n", key, strings.Join(values, ", "))
+		sb.WriteString(fmt.Sprintf(">>   %s: %s\n", key, strings.Join(values, ", ")))
 	}
 
 	bodyBytes, err := captureRequestBody(r)
 	if err != nil {
-		fmt.Printf(">>   [Error reading body: %v]\n", err)
-		return
+		sb.WriteString(fmt.Sprintf(">>   [Error reading body: %v]\n", err))
+	} else if len(bodyBytes) > 0 {
+		contentType := r.Header.Get("Content-Type")
+		sb.WriteString(fmt.Sprintf("%s>> Body:%s\n", colorGreen, colorReset))
+		sb.WriteString(fmt.Sprintf(">>   %s\n", formatBody(bodyBytes, contentType)))
 	}
 
-	if len(bodyBytes) > 0 {
-		contentType := r.Header.Get("Content-Type")
-		fmt.Printf("%s>> Body:%s\n", colorGreen, colorReset)
-		fmt.Printf(">>   %s\n", formatBody(bodyBytes, contentType))
-	}
+	return sb.String()
 }
 
-func logResponse(w *loggingResponseWriter, duration time.Duration) {
-	fmt.Printf("\n%s<< RESPONSE SENT%s\n",
-		colorYellow, colorReset)
-	fmt.Printf("%s<< Status:%s %d %s\n",
+// captureResponseLog formats response information and returns it as a string
+func captureResponseLog(w *loggingResponseWriter, duration time.Duration) string {
+	var sb strings.Builder
+
+	sb.WriteString(fmt.Sprintf("\n%s<< RESPONSE SENT%s\n",
+		colorYellow, colorReset))
+	sb.WriteString(fmt.Sprintf("%s<< Status:%s %d %s\n",
 		colorYellow,
 		colorReset,
 		w.statusCode,
-		http.StatusText(w.statusCode))
-	fmt.Printf("%s<< Size:%s %d bytes\n", colorYellow, colorReset, w.size)
-	fmt.Printf("%s<< Duration:%s %v\n", colorYellow, colorReset, duration)
+		http.StatusText(w.statusCode)))
+	sb.WriteString(fmt.Sprintf("%s<< Size:%s %d bytes\n", colorYellow, colorReset, w.size))
+	sb.WriteString(fmt.Sprintf("%s<< Duration:%s %v\n", colorYellow, colorReset, duration))
 
-	fmt.Printf("%s<< Headers:%s\n", colorYellow, colorReset)
+	sb.WriteString(fmt.Sprintf("%s<< Headers:%s\n", colorYellow, colorReset))
 	for key, values := range w.Header() {
-		fmt.Printf("<<   %s: %s\n", key, strings.Join(values, ", "))
+		sb.WriteString(fmt.Sprintf("<<   %s: %s\n", key, strings.Join(values, ", ")))
 	}
 
 	if w.body != nil && w.body.Len() > 0 {
 		contentType := w.Header().Get("Content-Type")
-		fmt.Printf("%s<< Body:%s\n", colorYellow, colorReset)
-		fmt.Printf("<<   %s\n", formatBody(w.body.Bytes(), contentType))
+		sb.WriteString(fmt.Sprintf("%s<< Body:%s\n", colorYellow, colorReset))
+		sb.WriteString(fmt.Sprintf("<<   %s\n", formatBody(w.body.Bytes(), contentType)))
 	}
+
+	return sb.String()
 }
 
 // loggingHandler is a middleware that intercepts requests and responses for logging
@@ -343,15 +350,88 @@ func loggingHandler(routeKey string, target string, next http.Handler) http.Hand
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
-		logRequest(r, routeKey, target)
+		// Create a buffer to capture log output
+		var logBuffer bytes.Buffer
 
+		// Log request to console and capture for file
+		requestLog := captureRequestLog(r, routeKey, target)
+		fmt.Print(requestLog)
+		logBuffer.WriteString(stripAnsiCodes(requestLog))
+
+		// Process the request
 		lw := newLoggingResponseWriter(w)
-
 		next.ServeHTTP(lw, r)
 
+		// Calculate duration
 		duration := time.Since(start)
-		logResponse(lw, duration)
+
+		// Log response to console and capture for file
+		responseLog := captureResponseLog(lw, duration)
+		fmt.Print(responseLog)
+		logBuffer.WriteString(stripAnsiCodes(responseLog))
+
+		// Create log file with the combined log content
+		logPath := logFilePath(routeKey)
+		if err := writeToLogFile(logPath, logBuffer.String()); err != nil {
+			log.Printf("Failed to write log file: %v", err)
+		}
 	})
+}
+
+// logFilePath generates a file path for the log file based on the route and current time
+func logFilePath(routeKey string) string {
+	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
+	timestamp = strings.ReplaceAll(timestamp, ":", "-")
+
+	// Create logs directory if it doesn't exist
+	logsDir := "./logs"
+	_, err := os.Stat(logsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			err := os.Mkdir(logsDir, 0700)
+			if err != nil {
+				log.Printf("Failed to create logs directory: %v", err)
+				logsDir = "."
+			}
+		}
+	}
+
+	// Return the full path including directory
+	return filepath.Join(logsDir, fmt.Sprintf("%s-%s.log", routeKey, timestamp))
+}
+
+// writeToLogFile writes the log content to a file
+func writeToLogFile(filePath string, content string) error {
+	f, err := os.Create(filePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// Normalize line endings to just \n (Unix style)
+	// First replace Windows style (\r\n) with Unix style (\n)
+	normalizedContent := strings.ReplaceAll(content, "\r\n", "\n")
+	// Then replace any remaining old Mac style line endings (\r) with Unix style (\n)
+	normalizedContent = strings.ReplaceAll(normalizedContent, "\r", "\n")
+
+	_, err = f.WriteString(normalizedContent)
+	return err
+}
+
+// stripAnsiCodes removes ANSI color codes from a string
+func stripAnsiCodes(s string) string {
+	// ANSI escape code pattern
+	r := strings.NewReplacer(
+		colorReset, "",
+		colorRed, "",
+		colorGreen, "",
+		colorYellow, "",
+		colorBlue, "",
+		colorPurple, "",
+		colorCyan, "",
+		colorWhite, "",
+	)
+	return r.Replace(s)
 }
 
 func main() {
@@ -383,13 +463,27 @@ func main() {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seg := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
 		if len(seg) == 0 || seg[0] == "" {
-			fmt.Printf("\n%s!! ROUTE NOT FOUND%s: %s\n", colorRed, colorReset, r.URL.Path)
+			// Create error message for route not found
+			errorMsg := fmt.Sprintf("\n%s!! ROUTE NOT FOUND%s: %s\n", colorRed, colorReset, r.URL.Path)
+			fmt.Print(errorMsg)
+
+			// Log the error to a file (using "error" as the route key)
+			errorLogPath := logFilePath("error")
+			writeToLogFile(errorLogPath, stripAnsiCodes(errorMsg))
+
 			http.NotFound(w, r)
 			return
 		}
 		port, ok := routes[seg[0]]
 		if !ok {
-			fmt.Printf("\n%s!! ROUTE NOT FOUND%s: %s\n", colorRed, colorReset, seg[0])
+			// Create error message for route not found
+			errorMsg := fmt.Sprintf("\n%s!! ROUTE NOT FOUND%s: %s\n", colorRed, colorReset, seg[0])
+			fmt.Print(errorMsg)
+
+			// Log the error to a file (using "error" as the route key)
+			errorLogPath := logFilePath("error")
+			writeToLogFile(errorLogPath, stripAnsiCodes(errorMsg))
+
 			http.NotFound(w, r)
 			return
 		}

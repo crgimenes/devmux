@@ -32,4 +32,4 @@ devmux
 release.sh
 dist
 *.sql
-
+logs/*
