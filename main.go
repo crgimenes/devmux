@@ -227,7 +227,7 @@ func (lw *loggingResponseWriter) Write(b []byte) (int, error) {
 
 func newLoggingResponseWriter(w http.ResponseWriter) *loggingResponseWriter {
 	var buf *bytes.Buffer
-	// Verificamos o Content-Type apenas no momento da escrita
+	// We check the Content-Type only at the time of writing
 	buf = &bytes.Buffer{}
 	return &loggingResponseWriter{
 		ResponseWriter: w,
@@ -241,14 +241,37 @@ func formatBody(body []byte, contentType string) string {
 		return "[Empty body]"
 	}
 
+	// Process www-form-urlencoded forms
+	if strings.Contains(contentType, "application/x-www-form-urlencoded") {
+		formValues, err := url.ParseQuery(string(body))
+		if err == nil {
+			var sb strings.Builder
+			sb.WriteString("[Form data]\n")
+
+			for key, values := range formValues {
+				sb.WriteString(fmt.Sprintf(">>   %s: %s\n", key, strings.Join(values, ", ")))
+			}
+			return sb.String()
+		}
+		// If parsing fails, fall back to default behavior
+	}
+
+	// Process multipart/form-data (without showing binary data)
+	if strings.Contains(contentType, "multipart/form-data") {
+		return fmt.Sprintf("[Multipart form - Size: %v bytes]\nContent-Type: %s",
+			len(body), contentType)
+	}
+
+	// Process other readable content types
 	if strings.Contains(contentType, "text") ||
-		strings.Contains(contentType, "json") ||
 		strings.Contains(contentType, "xml") ||
+		strings.Contains(contentType, "json") ||
 		strings.Contains(contentType, "html") {
 		return string(body)
 	}
 
-	return fmt.Sprintf("[Binary data, Content-Type: %s - Size: %v bytes]",
+	// Binary or unknown data
+	return fmt.Sprintf("[Binary content - Content-Type: %s - Size: 0x%X bytes]",
 		contentType,
 		len(body))
 }
@@ -293,7 +316,7 @@ func logRequest(r *http.Request, routeKey string, target string) {
 }
 
 func logResponse(w *loggingResponseWriter, duration time.Duration) {
-	fmt.Printf("\n%s<< RESPONSE%s\n",
+	fmt.Printf("\n%s<< RESPONSE SENT%s\n",
 		colorYellow, colorReset)
 	fmt.Printf("%s<< Status:%s %d %s\n",
 		colorYellow,
@@ -360,13 +383,13 @@ func main() {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seg := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
 		if len(seg) == 0 || seg[0] == "" {
-			fmt.Printf("\n%s!! ROTA NÃO ENCONTRADA%s: %s\n", colorRed, colorReset, r.URL.Path)
+			fmt.Printf("\n%s!! ROUTE NOT FOUND%s: %s\n", colorRed, colorReset, r.URL.Path)
 			http.NotFound(w, r)
 			return
 		}
 		port, ok := routes[seg[0]]
 		if !ok {
-			fmt.Printf("\n%s!! ROTA NÃO ENCONTRADA%s: %s\n", colorRed, colorReset, seg[0])
+			fmt.Printf("\n%s!! ROUTE NOT FOUND%s: %s\n", colorRed, colorReset, seg[0])
 			http.NotFound(w, r)
 			return
 		}
