@@ -213,6 +213,14 @@ func (l *Lua) MustGetMap(vGlobal string) map[string]string {
 	return ret
 }
 
+func (l *Lua) MustGetBool(vGlobal string) bool {
+	v, ok := l.ls.GetGlobal(vGlobal).(lua.LBool)
+	if !ok {
+		log.Fatalf("Erro ao converter %q para bool", vGlobal)
+	}
+	return bool(v)
+}
+
 func (l *Lua) NewTable() *lua.LTable {
 	return l.ls.NewTable()
 }
