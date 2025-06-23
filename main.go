@@ -444,7 +444,8 @@ func main() {
 		initFile = "./devmux_init.lua"
 	}
 
-	key := filepath.Join(os.Getenv("HOME"), ".ssh", "id_ed25519")
+	// TODO: Read key, user, host, from init.lua or ~/.ssh/config
+	key := filepath.Join(os.Getenv("HOME"), ".ssh", "id_rsa")
 
 	runLuaFile(initFile)
 
