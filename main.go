@@ -462,11 +462,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to open SSH config: %v", err.Error())
 	}
-	defer f.Close()
 	sshCfg, err := ssh_config.Decode(f)
 	if err != nil {
 		log.Fatalf("failed to decode SSH config: %v", err.Error())
 	}
+	f.Close()
+
 	sshUser, _ := sshCfg.Get(host, "User")
 	if sshUser == "" {
 		sshUser = os.Getenv("USER")
