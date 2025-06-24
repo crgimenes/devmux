@@ -547,13 +547,28 @@ func main() {
 
 	server := http.Server{Handler: handler}
 
-	// 3. CTRL-C close connection
+	// Handle graceful shutdown on CTRL-C/SIGTERM
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	go func() { <-sig; ln.Close(); sshClient.Close() }()
+	go func() {
+		s := <-sig
+		log.Printf("Received signal %v, shutting down...", s)
+
+		// Close listener and SSH connections
+		log.Println("Closing network connections...")
+		ln.Close()
+
+		log.Println("Closing SSH tunnel...")
+		sshClient.Close()
+
+		log.Println("Shutdown complete. Goodbye!")
+		os.Exit(0)
+	}()
 
 	log.Printf("→ VPS reverse proxy port %s ➜ SSH ➜ devmux ➜ local ports", remotePort)
 	if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
+		if err != http.ErrServerClosed {
+			log.Fatalf("Failed to start server: %v", err)
+		}
 	}
 }
