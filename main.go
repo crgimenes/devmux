@@ -484,6 +484,14 @@ func main() {
 		sshKeyPath = os.ExpandEnv(identity)
 	}
 
+	if strings.HasPrefix(sshKeyPath, "~") {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			log.Fatalf("Failed to get home directory: %v", err)
+		}
+		sshKeyPath = strings.Replace(sshKeyPath, "~", homeDir, 1)
+	}
+
 	if sshPort != "" {
 		hostname = fmt.Sprintf("%s:%s", hostname, sshPort)
 	}
