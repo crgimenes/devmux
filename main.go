@@ -19,6 +19,7 @@ import (
 
 	luaEngine "github.com/yuin/gopher-lua"
 
+	"github.com/kevinburke/ssh_config"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 
@@ -37,7 +38,6 @@ const (
 )
 
 var (
-	user       = ""
 	host       = ""
 	remotePort = "10000"
 	routes     = map[string]string{}
@@ -101,7 +101,6 @@ func runLuaFile(name string) {
 	defer L.Close()
 
 	//L.SetGlobal("devmux_path", devmuxPath)
-	L.SetGlobal("User", user) // TODO: get user from ~/.ssh/config
 	L.SetGlobal("Host", "")
 	L.SetGlobal("RemotePort", remotePort)
 	L.SetGlobal("Routes", L.GetState().NewTable())
@@ -132,7 +131,6 @@ func runLuaFile(name string) {
 		}
 	})
 
-	user = L.MustGetString("User")
 	host = L.MustGetString("Host")
 	remotePort = L.MustGetString("RemotePort")
 
@@ -444,12 +442,46 @@ func main() {
 		initFile = "./devmux_init.lua"
 	}
 
-	// TODO: Read key, user, host, from init.lua or ~/.ssh/config
-	key := filepath.Join(os.Getenv("HOME"), ".ssh", "id_rsa")
+	//key := filepath.Join(os.Getenv("HOME"), ".ssh", "id_rsa")
 
 	runLuaFile(initFile)
 
-	sshClient := dialSSH(user, host, key)
+	///////////////////////////////
+	// Read key, user, host, from init.lua or ~/.ssh/config
+
+	sshPort := "22"
+
+	configPath := os.ExpandEnv("$HOME/.ssh/config")
+	f, err := os.Open(filepath.Clean(configPath))
+	if err != nil {
+		log.Fatalf("failed to open SSH config: %v", err.Error())
+	}
+	defer f.Close()
+	sshCfg, err := ssh_config.Decode(f)
+	if err != nil {
+		log.Fatalf("failed to decode SSH config: %v", err.Error())
+	}
+	sshUser, _ := sshCfg.Get(host, "User")
+	if sshUser == "" {
+		sshUser = os.Getenv("USER")
+	}
+	hostname, _ := sshCfg.Get(host, "Hostname")
+	if hostname == "" {
+		log.Fatalf("no Hostname found for alias %s in SSH config", host)
+	}
+	if port, _ := sshCfg.Get(host, "Port"); port != "" {
+		sshPort = port
+	}
+	sshKeyPath := ""
+	if identity, _ := sshCfg.Get(host, "IdentityFile"); identity != "" {
+		sshKeyPath = os.ExpandEnv(identity)
+	}
+
+	if sshPort != "" {
+		hostname = fmt.Sprintf("%s:%s", hostname, sshPort)
+	}
+
+	sshClient := dialSSH(sshUser, hostname, sshKeyPath)
 	defer sshClient.Close()
 	go keepAlive(sshClient, 30*time.Second)
 
