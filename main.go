@@ -22,6 +22,7 @@ import (
 	"github.com/kevinburke/ssh_config"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/crypto/ssh/knownhosts"
 
 	"devmux/lua"
 )
@@ -136,18 +137,21 @@ func runLuaFile(name string) {
 
 }
 
-func dialSSH(user, host, keyFile string) *ssh.Client {
-	auth, err := agentAuth()
+func dialSSH(user, host, sshKeyPath string) *ssh.Client {
+	auth, err := agentAuth(sshKeyPath)
 	if err != nil {
-		auth, err = keyAuth(keyFile)
-		if err != nil {
-			log.Fatalf("auth: %v", err)
-		}
+		log.Fatalf("auth: %v", err)
 	}
+
+	hostKeyCallback, err := knownhosts.New(os.ExpandEnv("$HOME/.ssh/known_hosts"))
+	if err != nil {
+		log.Fatal("could not create hostkeycallback function: ", err)
+	}
+
 	cfg := &ssh.ClientConfig{
 		User:            user,
 		Auth:            []ssh.AuthMethod{auth},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // TODO: use a proper host key callback
+		HostKeyCallback: hostKeyCallback,
 		Timeout:         10 * time.Second,
 	}
 	c, err := ssh.Dial("tcp", host, cfg)
@@ -157,26 +161,28 @@ func dialSSH(user, host, keyFile string) *ssh.Client {
 	return c
 }
 
-func agentAuth() (ssh.AuthMethod, error) {
+func loadPrivateKey(keyPath string) (ssh.Signer, error) {
+	key, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, err
+	}
+	return ssh.ParsePrivateKey(key)
+}
+
+func agentAuth(sshKeyPath string) (ssh.AuthMethod, error) {
 	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
 		conn, err := net.Dial("unix", sock)
 		if err == nil {
 			return ssh.PublicKeysCallback(agent.NewClient(conn).Signers), nil
 		}
 	}
-	return nil, io.EOF
-}
 
-func keyAuth(file string) (ssh.AuthMethod, error) {
-	b, err := os.ReadFile(file)
+	signer, err := loadPrivateKey(sshKeyPath)
 	if err != nil {
-		return nil, err
+		log.Fatalf("Failed to load private key: %v", err)
 	}
-	sign, err := ssh.ParsePrivateKey(b)
-	if err != nil {
-		return nil, err
-	}
-	return ssh.PublicKeys(sign), nil
+
+	return ssh.PublicKeys(signer), nil
 }
 
 func keepAlive(c *ssh.Client, every time.Duration) {
@@ -545,7 +551,7 @@ func main() {
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	go func() { <-sig; ln.Close(); sshClient.Close() }()
 
-	log.Printf("→ Ready: Caddy ➜ VPS:%s ➜ SSH ➜ devmux ➜ local ports", remotePort)
+	log.Printf("→ VPS reverse proxy port %s ➜ SSH ➜ devmux ➜ local ports", remotePort)
 	if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
