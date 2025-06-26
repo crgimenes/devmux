@@ -505,7 +505,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("remote listen %s: %v", remotePort, err)
 	}
-	log.Printf("✓ Remote port %s open on VPS (loopback)", remotePort)
+	fmt.Printf("%s✓%s Remote port %s%s%s open on VPS (loopback)\n", colorGreen, colorReset, colorCyan, remotePort, colorReset)
 
 	// 2. listen on local port
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -560,20 +560,25 @@ func main() {
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		s := <-sig
-		log.Printf("Received signal %v, shutting down...", s)
+		fmt.Printf("%sReceived signal %v, shutting down...%s\n", colorYellow, s, colorReset)
 
 		// Close listener and SSH connections
-		log.Println("Closing network connections...")
+		fmt.Printf("%sClosing network connections...%s\n", colorYellow, colorReset)
 		ln.Close()
 
-		log.Println("Closing SSH tunnel...")
+		fmt.Printf("%sClosing SSH tunnel...%s\n", colorYellow, colorReset)
 		sshClient.Close()
 
-		log.Println("Shutdown complete. Goodbye!")
+		fmt.Printf("%sShutdown complete. Goodbye!%s\n", colorGreen, colorReset)
 		os.Exit(0)
 	}()
 
-	log.Printf("→ VPS reverse proxy port %s ➜ SSH ➜ devmux ➜ local ports", remotePort)
+	fmt.Printf("%s→%s VPS reverse proxy port %s%s%s %s➜%s SSH %s➜%s devmux %s➜%s local ports\n", 
+		colorBlue, colorReset, 
+		colorCyan, remotePort, colorReset,
+		colorGreen, colorReset,
+		colorGreen, colorReset,
+		colorGreen, colorReset)
 	if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 		if err != http.ErrServerClosed {
 			log.Fatalf("Failed to start server: %v", err)
