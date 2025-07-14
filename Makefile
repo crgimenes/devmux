@@ -1,4 +1,4 @@
-BINARY_NAME=devmux
+BINARY_NAME=$(shell basename $(shell pwd))
 
 export CGO_ENABLED=0
 GIT_TAG := $(shell git describe --tags --always)
