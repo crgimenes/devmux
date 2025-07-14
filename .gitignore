@@ -33,3 +33,5 @@ release.sh
 dist
 *.sql
 logs/*
+release.sh
+
