@@ -34,4 +34,5 @@ dist
 *.sql
 logs/*
 release.sh
+devmux-linux-amd64
 
