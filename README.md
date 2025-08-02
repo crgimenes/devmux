@@ -68,6 +68,18 @@ devmux uses Lua for configuration, providing powerful customization options. The
 
 ### Basic Configuration
 
+Configure your remote server with a reverse proxy to a port.
+
+Caddyfile example `/etc/caddy/Caddyfile`:
+
+```
+server.example.com {
+	reverse_proxy 127.0.0.1:10000
+}
+```
+
+Local configuration file (`~/.config/devmux/init.lua`):
+
 ```lua
 -- Remote server settings
 Host = "your-remote-server.com"
@@ -98,11 +110,12 @@ Routes = {
 
 ## How It Works
 
-1. **SSH Tunnel Creation**: devmux establishes a reverse SSH tunnel to your remote server
-2. **HTTP Proxy Server**: A local HTTP server captures incoming requests from the tunnel
-3. **Route Matching**: Requests are analyzed and routed based on URL path prefixes
-4. **Local Forwarding**: Matched requests are proxied to the corresponding local port
-5. **Response Relay**: Responses are sent back through the tunnel to the client
+1. **The remote http server** listens http and https requests and redirects them to the 10000 port.
+2. **SSH Tunnel Creation**: devmux establishes a reverse SSH tunnel to your remote server at port 10000.
+3. **HTTP Proxy Server**: A local HTTP server captures incoming requests from the tunnel
+4. **Route Matching**: Requests are analyzed and routed based on URL path prefixes
+5. **Local Forwarding**: Matched requests are proxied to the corresponding local port
+6. **Response Relay**: Responses are sent back through the tunnel to the client
 
 ## Use Cases
 
@@ -115,31 +128,6 @@ Routes = {
     ["frontend"] = "3000",    -- React/Vue/Angular dev server
     ["backend"]  = "8000",    -- API server
     ["db-admin"] = "8080",    -- Database administration tool
-}
-```
-
-### Microservices Development
-
-Route different API paths to different microservices:
-
-```lua
-Routes = {
-    ["auth"]     = "3001",    -- Authentication service
-    ["users"]    = "3002",    -- User management service
-    ["orders"]   = "3003",    -- Order processing service
-    ["payments"] = "3004",    -- Payment service
-}
-```
-
-### Demo and Testing
-
-Share your work-in-progress with clients or stakeholders:
-
-```lua
-Routes = {
-    ["demo"]     = "3000",    -- Demo application
-    ["admin"]    = "3001",    -- Admin interface
-    ["docs"]     = "4000",    -- Documentation site
 }
 ```
 
@@ -163,50 +151,6 @@ Host your-server.com
     ServerAliveCountMax 3
 ```
 
-## Logging and Debugging
-
-devmux provides detailed request logging with color-coded output:
-
-• **Green**: Successful request routing
-• **Yellow**: Warning messages and connection events
-• **Red**: Errors and failed requests
-• **Blue**: Request details and headers
-• **Cyan**: Response information
-
-Example log output:
-
-```text
-[2025-08-02 10:30:15] 🔀 Routing: /api → localhost:3000
-[2025-08-02 10:30:15] 📊 GET /api/users HTTP/1.1
-[2025-08-02 10:30:15] ✅ Response: 200 OK (45ms)
-```
-
-## Security Features
-
-• **SSH Encryption**: All traffic is encrypted through SSH tunnels
-• **Key-Based Authentication**: No password authentication for enhanced security
-• **Local Binding**: Proxy server only binds to localhost
-• **Request Validation**: HTTP request parsing and validation
-• **Connection Timeout**: Automatic cleanup of stale connections
-
-## Advanced Configuration
-
-### Custom Request Processing
-
-```lua
--- Add custom headers or modify requests
-function ProcessRequest(path, method, headers)
-    -- Custom logic here
-    return true  -- Continue processing
-end
-
--- Custom response handling
-function ProcessResponse(status, headers, body)
-    -- Custom logic here
-    return status, headers, body
-end
-```
-
 ## Troubleshooting
 
 ### Common Issues
@@ -225,15 +169,6 @@ end
 
 - Verify your SSH key is added to the SSH agent: `ssh-add -l`
 - Test SSH connection manually: `ssh your-server.com`
-
-### Debug Mode
-
-Enable verbose logging by setting environment variables:
-
-```bash
-export DEBUG=1
-./devmux
-```
 
 ## Contributing
 
