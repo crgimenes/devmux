@@ -7,13 +7,13 @@ A powerful reverse tunnel proxy tool that creates secure tunnels to remote serve
 
 ## Features
 
-• 🔒 **Secure SSH Tunneling**: Create encrypted reverse tunnels using SSH with key-based authentication
-• 🔀 **Intelligent HTTP Routing**: Route requests to different local ports based on URL paths
-• 🛠️ **Lua Configuration**: Flexible configuration system with Lua scripting support
-• 📊 **Request Logging**: Detailed logging of HTTP requests with colored output for better debugging
-• 🔑 **SSH Agent Support**: Seamless integration with SSH agent for key management
-• 🌐 **Multi-Service Support**: Expose multiple local development services through one tunnel
-• ⚡ **Keep-Alive**: Automatic connection maintenance to prevent tunnel timeouts
+- **Secure SSH Tunneling**: Create encrypted reverse tunnels using SSH with key-based authentication.
+- **Intelligent HTTP Routing**: Route requests to different local ports based on URL paths.
+- **Lua Configuration**: Flexible configuration system with Lua scripting support.
+- **Request Logging**: Detailed logging of HTTP requests with colored output for better debugging.
+- **SSH Agent Support**: Seamless integration with SSH agent for key management.
+- **Multi-Service Support**: Expose multiple local development services through one tunnel.
+- **Keep-Alive**: Automatic connection maintenance to prevent tunnel timeouts.
 
 ## Installation
 
