@@ -573,8 +573,8 @@ func main() {
 		os.Exit(0)
 	}()
 
-	fmt.Printf("%s→%s VPS reverse proxy port %s%s%s %s➜%s SSH %s➜%s devmux %s➜%s local ports\n", 
-		colorBlue, colorReset, 
+	fmt.Printf("%s→%s VPS reverse proxy port %s%s%s %s➜%s SSH %s➜%s devmux %s➜%s local ports\n",
+		colorBlue, colorReset,
 		colorCyan, remotePort, colorReset,
 		colorGreen, colorReset,
 		colorGreen, colorReset,
