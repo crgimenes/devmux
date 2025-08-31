@@ -560,7 +560,7 @@ func main() {
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		s := <-sig
-		fmt.Printf("%sReceived signal %v, shutting down...%s\n", colorYellow, s, colorReset)
+		fmt.Printf("\n%sReceived signal %v, shutting down...%s\n", colorYellow, s, colorReset)
 
 		// Close listener and SSH connections
 		fmt.Printf("%sClosing network connections...%s\n", colorYellow, colorReset)
