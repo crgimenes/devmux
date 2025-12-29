@@ -3,9 +3,9 @@ module devmux
 go 1.25
 
 require (
-	github.com/kevinburke/ssh_config v1.2.0
+	github.com/kevinburke/ssh_config v1.4.0
 	github.com/yuin/gopher-lua v1.1.1
-	golang.org/x/crypto v0.41.0
+	golang.org/x/crypto v0.46.0
 )
 
-require golang.org/x/sys v0.35.0 // indirect
+require golang.org/x/sys v0.39.0 // indirect
