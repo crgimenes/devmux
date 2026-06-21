@@ -17,14 +17,12 @@ import (
 	"syscall"
 	"time"
 
-	luaEngine "github.com/yuin/gopher-lua"
+	"github.com/crgimenes/filo"
 
 	"github.com/kevinburke/ssh_config"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
-
-	"devmux/lua"
 )
 
 const (
@@ -67,9 +65,9 @@ func configHome() string {
 	return configHome
 }
 
-func getInitLuaPath() string {
+func getInitFiloPath() string {
 	configHome := configHome()
-	return filepath.Join(configHome, "devmux", "init.lua")
+	return filepath.Join(configHome, "devmux", "init.filo")
 }
 
 // createConfigDir creates the config directory if it does not exist.
@@ -89,52 +87,36 @@ func createConfigDir() {
 	}
 }
 
-func runLuaFile(name string) {
-	//devmuxPath = "./" // TODO: get better default path
-
+func runFiloFile(name string) {
 	if !fileExists(name) {
 		//log.Fatalf("Config file %s not found", name)
 		return
 	}
 
-	// Create a new Lua state.
-	L := lua.New()
-	defer L.Close()
+	// Create a new Filo interpreter.
+	f := filo.New()
+	defer f.Close()
 
-	//L.SetGlobal("devmux_path", devmuxPath)
-	L.SetGlobal("Host", "")
-	L.SetGlobal("RemotePort", remotePort)
-	L.SetGlobal("Routes", L.GetState().NewTable())
+	// Seed the globals with the current defaults so the config file can read
+	// and selectively override them.
+	f.SetGlobal("Host", host)
+	f.SetGlobal("RemotePort", remotePort)
+	f.SetGlobal("Routes", routes)
 
-	// Read the Lua file.
+	// Read the Filo file.
 	b, err := os.ReadFile(filepath.Clean(name))
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	err = L.DoString(string(b))
+	err = f.DoString(string(b))
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Get the routes table from Lua.
-	routesTable := L.GetGlobalTable("Routes")
-	if routesTable == nil {
-		log.Fatal("Failed to get routes table from Lua")
-	}
-
-	routes = make(map[string]string)
-	routesTable.ForEach(func(k, v luaEngine.LValue) {
-		if k.Type() == luaEngine.LTString && v.Type() == luaEngine.LTString {
-			key := k.String()
-			value := v.String()
-			routes[key] = value
-		}
-	})
-
-	host = L.MustGetString("Host")
-	remotePort = L.MustGetString("RemotePort")
-
+	host = f.MustGetString("Host")
+	remotePort = f.MustGetString("RemotePort")
+	routes = f.MustGetMap("Routes")
 }
 
 func dialSSH(user, host, sshKeyPath string) *ssh.Client {
@@ -442,18 +424,18 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Llongfile)
 
 	createConfigDir()
-	initFile := getInitLuaPath()
+	initFile := getInitFiloPath()
 
-	if fileExists("./devmux_init.lua") {
-		initFile = "./devmux_init.lua"
+	if fileExists("./devmux_init.filo") {
+		initFile = "./devmux_init.filo"
 	}
 
 	//key := filepath.Join(os.Getenv("HOME"), ".ssh", "id_rsa")
 
-	runLuaFile(initFile)
+	runFiloFile(initFile)
 
 	///////////////////////////////
-	// Read key, user, host, from init.lua or ~/.ssh/config
+	// Read key, user, host, from init.filo or ~/.ssh/config
 
 	sshPort := "22"
 

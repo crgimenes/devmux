@@ -9,7 +9,7 @@ A powerful reverse tunnel proxy tool that creates secure tunnels to remote serve
 
 - **Secure SSH Tunneling**: Create encrypted reverse tunnels using SSH with key-based authentication.
 - **Intelligent HTTP Routing**: Route requests to different local ports based on URL paths.
-- **Lua Configuration**: Flexible configuration system with Lua scripting support.
+- **Filo Configuration**: Flexible configuration system using the [Filo](https://github.com/crgimenes/filo) scripting language.
 - **Request Logging**: Detailed logging of HTTP requests with colored output for better debugging.
 - **SSH Agent Support**: Seamless integration with SSH agent for key management.
 - **Multi-Service Support**: Expose multiple local development services through one tunnel.
@@ -39,16 +39,15 @@ go build -o devmux .
    mkdir -p ~/.config/devmux
    ```
 
-2. **Configure your routes** (`~/.config/devmux/init.lua`):
+2. **Configure your routes** (`~/.config/devmux/init.filo`):
 
-   ```lua
-   Host       = "your-server.com"
-   RemotePort = "10000"
-   Routes     = {
-       ["api"]     = "3000",  -- Routes /api to localhost:3000
-       ["web"]     = "8080",  -- Routes /web to localhost:8080
-       ["admin"]   = "9000",  -- Routes /admin to localhost:9000
-   }
+   ```scheme
+   (set Host "your-server.com")
+   (set RemotePort "10000")
+   (set Routes (list
+       (tuple "api"   "3000")    ;; Routes /api to localhost:3000
+       (tuple "web"   "8080")    ;; Routes /web to localhost:8080
+       (tuple "admin" "9000")))  ;; Routes /admin to localhost:9000
    ```
 
 3. **Start the tunnel**:
@@ -64,7 +63,7 @@ go build -o devmux .
 
 ## Configuration
 
-devmux uses Lua for configuration, providing powerful customization options. The configuration file should be placed at `~/.config/devmux/init.lua` or as `devmux_init.lua` in your current directory.
+devmux uses [Filo](https://github.com/crgimenes/filo) for configuration, providing powerful customization options. The configuration file should be placed at `~/.config/devmux/init.filo` or as `devmux_init.filo` in your current directory.
 
 ### Basic Configuration
 
@@ -78,34 +77,32 @@ server.example.com {
 }
 ```
 
-Local configuration file (`~/.config/devmux/init.lua`):
+Local configuration file (`~/.config/devmux/init.filo`):
 
-```lua
--- Remote server settings
-Host = "your-remote-server.com"
-RemotePort = "10000"
+```scheme
+;; Remote server settings
+(set Host "your-remote-server.com")
+(set RemotePort "10000")
 
--- Route configuration
-Routes = {
-    ["api"] = "3000",      -- API service on port 3000
-    ["web"] = "8080",      -- Web frontend on port 8080
-    ["docs"] = "4000",     -- Documentation on port 4000
-    ["metrics"] = "9090",  -- Monitoring on port 9090
-}
+;; Route configuration
+(set Routes (list
+    (tuple "api"     "3000")    ;; API service on port 3000
+    (tuple "web"     "8080")    ;; Web frontend on port 8080
+    (tuple "docs"    "4000")    ;; Documentation on port 4000
+    (tuple "metrics" "9090")))  ;; Monitoring on port 9090
 ```
 
 ### Route Patterns
 
 Routes are defined as path prefixes that map to local ports:
 
-```lua
-Routes = {
-    ["app"]        = "3000",  -- /app/* → localhost:3000/*
-    ["api/v1"]     = "8001",  -- /api/v1/* → localhost:8001/*
-    ["api/v2"]     = "8002",  -- /api/v2/* → localhost:8002/*
-    ["static"]     = "8080",  -- /static/* → localhost:8080/*
-    ["websocket"]  = "3001",  -- /websocket/* → localhost:3001/*
-}
+```scheme
+(set Routes (list
+    (tuple "app"       "3000")    ;; /app/* → localhost:3000/*
+    (tuple "api/v1"    "8001")    ;; /api/v1/* → localhost:8001/*
+    (tuple "api/v2"    "8002")    ;; /api/v2/* → localhost:8002/*
+    (tuple "static"    "8080")    ;; /static/* → localhost:8080/*
+    (tuple "websocket" "3001")))  ;; /websocket/* → localhost:3001/*
 ```
 
 ## How It Works
@@ -123,12 +120,11 @@ Routes = {
 
 Expose your local development stack to remote collaborators or testing environments:
 
-```lua
-Routes = {
-    ["frontend"] = "3000",    -- React/Vue/Angular dev server
-    ["backend"]  = "8000",    -- API server
-    ["db-admin"] = "8080",    -- Database administration tool
-}
+```scheme
+(set Routes (list
+    (tuple "frontend" "3000")    ;; React/Vue/Angular dev server
+    (tuple "backend"  "8000")    ;; API server
+    (tuple "db-admin" "8080")))  ;; Database administration tool
 ```
 
 ## SSH Configuration
