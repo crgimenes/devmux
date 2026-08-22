@@ -144,6 +144,8 @@ func dialSSH(user, host, sshKeyPath string) *ssh.Client {
 }
 
 func loadPrivateKey(keyPath string) (ssh.Signer, error) {
+	// #nosec G304 -- keyPath is the user's own SSH key, from the config or the
+	// ssh_config lookup; reading it is exactly what the flag asks for.
 	key, err := os.ReadFile(keyPath)
 	if err != nil {
 		return nil, err
@@ -153,6 +155,8 @@ func loadPrivateKey(keyPath string) (ssh.Signer, error) {
 
 func agentAuth(sshKeyPath string) (ssh.AuthMethod, error) {
 	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+		// #nosec G704 -- sock is the ssh-agent socket from the user's own
+		// environment, not a network address taken from any request.
 		conn, err := net.Dial("unix", sock)
 		if err == nil {
 			return ssh.PublicKeysCallback(agent.NewClient(conn).Signers), nil
@@ -212,9 +216,8 @@ func (lw *loggingResponseWriter) Write(b []byte) (int, error) {
 }
 
 func newLoggingResponseWriter(w http.ResponseWriter) *loggingResponseWriter {
-	var buf *bytes.Buffer
 	// We check the Content-Type only at the time of writing
-	buf = &bytes.Buffer{}
+	buf := &bytes.Buffer{}
 	return &loggingResponseWriter{
 		ResponseWriter: w,
 		statusCode:     http.StatusOK, // Default status code
@@ -235,7 +238,7 @@ func formatBody(body []byte, contentType string) string {
 			sb.WriteString("[Form data]\n")
 
 			for key, values := range formValues {
-				sb.WriteString(fmt.Sprintf(">>   %s: %s\n", key, strings.Join(values, ", ")))
+				fmt.Fprintf(&sb, ">>   %s: %s\n", key, strings.Join(values, ", "))
 			}
 			return sb.String()
 		}
@@ -280,24 +283,24 @@ func captureRequestBody(r *http.Request) ([]byte, error) {
 func captureRequestLog(r *http.Request, routeKey string, target string) string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("\n%s>> REQUEST RECEIVED%s\n",
-		colorGreen, colorReset))
-	sb.WriteString(fmt.Sprintf("%s>> Route:%s %s → %s\n", colorGreen, colorReset, routeKey, target))
-	sb.WriteString(fmt.Sprintf("%s>> Method:%s %s\n", colorGreen, colorReset, r.Method))
-	sb.WriteString(fmt.Sprintf("%s>> URL:%s %s%s\n", colorGreen, colorReset, r.Host, r.URL.String()))
+	fmt.Fprintf(&sb, "\n%s>> REQUEST RECEIVED%s\n",
+		colorGreen, colorReset)
+	fmt.Fprintf(&sb, "%s>> Route:%s %s → %s\n", colorGreen, colorReset, routeKey, target)
+	fmt.Fprintf(&sb, "%s>> Method:%s %s\n", colorGreen, colorReset, r.Method)
+	fmt.Fprintf(&sb, "%s>> URL:%s %s%s\n", colorGreen, colorReset, r.Host, r.URL.String())
 
-	sb.WriteString(fmt.Sprintf("%s>> Headers:%s\n", colorGreen, colorReset))
+	fmt.Fprintf(&sb, "%s>> Headers:%s\n", colorGreen, colorReset)
 	for key, values := range r.Header {
-		sb.WriteString(fmt.Sprintf(">>   %s: %s\n", key, strings.Join(values, ", ")))
+		fmt.Fprintf(&sb, ">>   %s: %s\n", key, strings.Join(values, ", "))
 	}
 
 	bodyBytes, err := captureRequestBody(r)
 	if err != nil {
-		sb.WriteString(fmt.Sprintf(">>   [Error reading body: %v]\n", err))
+		fmt.Fprintf(&sb, ">>   [Error reading body: %v]\n", err)
 	} else if len(bodyBytes) > 0 {
 		contentType := r.Header.Get("Content-Type")
-		sb.WriteString(fmt.Sprintf("%s>> Body:%s\n", colorGreen, colorReset))
-		sb.WriteString(fmt.Sprintf(">>   %s\n", formatBody(bodyBytes, contentType)))
+		fmt.Fprintf(&sb, "%s>> Body:%s\n", colorGreen, colorReset)
+		fmt.Fprintf(&sb, ">>   %s\n", formatBody(bodyBytes, contentType))
 	}
 
 	return sb.String()
@@ -307,25 +310,25 @@ func captureRequestLog(r *http.Request, routeKey string, target string) string {
 func captureResponseLog(w *loggingResponseWriter, duration time.Duration) string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("\n%s<< RESPONSE SENT%s\n",
-		colorYellow, colorReset))
-	sb.WriteString(fmt.Sprintf("%s<< Status:%s %d %s\n",
+	fmt.Fprintf(&sb, "\n%s<< RESPONSE SENT%s\n",
+		colorYellow, colorReset)
+	fmt.Fprintf(&sb, "%s<< Status:%s %d %s\n",
 		colorYellow,
 		colorReset,
 		w.statusCode,
-		http.StatusText(w.statusCode)))
-	sb.WriteString(fmt.Sprintf("%s<< Size:%s %d bytes\n", colorYellow, colorReset, w.size))
-	sb.WriteString(fmt.Sprintf("%s<< Duration:%s %v\n", colorYellow, colorReset, duration))
+		http.StatusText(w.statusCode))
+	fmt.Fprintf(&sb, "%s<< Size:%s %d bytes\n", colorYellow, colorReset, w.size)
+	fmt.Fprintf(&sb, "%s<< Duration:%s %v\n", colorYellow, colorReset, duration)
 
-	sb.WriteString(fmt.Sprintf("%s<< Headers:%s\n", colorYellow, colorReset))
+	fmt.Fprintf(&sb, "%s<< Headers:%s\n", colorYellow, colorReset)
 	for key, values := range w.Header() {
-		sb.WriteString(fmt.Sprintf("<<   %s: %s\n", key, strings.Join(values, ", ")))
+		fmt.Fprintf(&sb, "<<   %s: %s\n", key, strings.Join(values, ", "))
 	}
 
 	if w.body != nil && w.body.Len() > 0 {
 		contentType := w.Header().Get("Content-Type")
-		sb.WriteString(fmt.Sprintf("%s<< Body:%s\n", colorYellow, colorReset))
-		sb.WriteString(fmt.Sprintf("<<   %s\n", formatBody(w.body.Bytes(), contentType)))
+		fmt.Fprintf(&sb, "%s<< Body:%s\n", colorYellow, colorReset)
+		fmt.Fprintf(&sb, "<<   %s\n", formatBody(w.body.Bytes(), contentType))
 	}
 
 	return sb.String()
@@ -387,12 +390,21 @@ func logFilePath(routeKey string) string {
 }
 
 // writeToLogFile writes the log content to a file
-func writeToLogFile(filePath string, content string) error {
+func writeToLogFile(filePath string, content string) (err error) {
+	// #nosec G304 -- filePath is built by logFilePath from the logs dir, the
+	// route key and a timestamp; nothing in it comes from the request.
 	f, err := os.Create(filePath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	// A failed Close on a written file means a truncated log, so it has to
+	// reach the caller instead of disappearing in a bare defer.
+	defer func() {
+		cerr := f.Close()
+		if err == nil {
+			err = cerr
+		}
+	}()
 
 	// Normalize line endings to just \n (Unix style)
 	// First replace Windows style (\r\n) with Unix style (\n)
@@ -448,7 +460,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to decode SSH config: %v", err.Error())
 	}
-	f.Close()
+	_ = f.Close()
 
 	sshUser, _ := sshCfg.Get(host, "User")
 	if sshUser == "" {
@@ -479,7 +491,7 @@ func main() {
 	}
 
 	sshClient := dialSSH(sshUser, hostname, sshKeyPath)
-	defer sshClient.Close()
+	defer func() { _ = sshClient.Close() }()
 	go keepAlive(sshClient, 30*time.Second)
 
 	// 1. ask the server to listen on
@@ -499,7 +511,10 @@ func main() {
 
 			// Log the error to a file (using "error" as the route key)
 			errorLogPath := logFilePath("error")
-			writeToLogFile(errorLogPath, stripAnsiCodes(errorMsg))
+			werr := writeToLogFile(errorLogPath, stripAnsiCodes(errorMsg))
+			if werr != nil {
+				log.Printf("write error log: %v", werr)
+			}
 
 			http.NotFound(w, r)
 			return
@@ -512,7 +527,10 @@ func main() {
 
 			// Log the error to a file (using "error" as the route key)
 			errorLogPath := logFilePath("error")
-			writeToLogFile(errorLogPath, stripAnsiCodes(errorMsg))
+			werr := writeToLogFile(errorLogPath, stripAnsiCodes(errorMsg))
+			if werr != nil {
+				log.Printf("write error log: %v", werr)
+			}
 
 			http.NotFound(w, r)
 			return
@@ -526,16 +544,14 @@ func main() {
 		proxy := httputil.NewSingleHostReverseProxy(mustParseURL(target))
 		proxy.ErrorLog = log.Default()
 
-		originalDirector := proxy.Director
-		proxy.Director = func(req *http.Request) {
-			originalDirector(req)
-		}
-
 		// Use the middleware to log the request and response
 		loggingHandler(routeKey, target, proxy).ServeHTTP(w, r)
 	})
 
-	server := http.Server{Handler: handler}
+	// ReadHeaderTimeout bounds a client that opens a connection and dribbles
+	// headers forever (Slowloris). devmux listens on loopback, but the far end
+	// of the tunnel is a port open on the VPS.
+	server := http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 
 	// Handle graceful shutdown on CTRL-C/SIGTERM
 	sig := make(chan os.Signal, 1)
@@ -546,10 +562,10 @@ func main() {
 
 		// Close listener and SSH connections
 		fmt.Printf("%sClosing network connections...%s\n", colorYellow, colorReset)
-		ln.Close()
+		_ = ln.Close()
 
 		fmt.Printf("%sClosing SSH tunnel...%s\n", colorYellow, colorReset)
-		sshClient.Close()
+		_ = sshClient.Close()
 
 		fmt.Printf("%sShutdown complete. Goodbye!%s\n", colorGreen, colorReset)
 		os.Exit(0)
