@@ -23,7 +23,6 @@ go.work.sum
 
 # env file
 .env
-*.lua
 draft
 .DS_Store
 .vscode
@@ -33,6 +32,5 @@ release.sh
 dist
 *.sql
 logs/*
-release.sh
 devmux-linux-amd64
 

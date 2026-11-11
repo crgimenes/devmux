@@ -3,9 +3,15 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/ed25519"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -13,6 +19,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -31,10 +39,12 @@ const (
 	colorGreen  = "\033[32m"
 	colorYellow = "\033[33m"
 	colorBlue   = "\033[34m"
-	colorPurple = "\033[35m"
 	colorCyan   = "\033[36m"
-	colorWhite  = "\033[37m"
 )
+
+// maxLoggedBody caps what is kept of each body for the log; the proxied
+// stream itself is never truncated.
+const maxLoggedBody = 64 << 10
 
 var (
 	host       = ""
@@ -42,58 +52,47 @@ var (
 	routes     = map[string]string{}
 )
 
+var ansiStripper = strings.NewReplacer(
+	colorReset, "",
+	colorRed, "",
+	colorGreen, "",
+	colorYellow, "",
+	colorBlue, "",
+	colorCyan, "",
+)
+
 func fileExists(name string) bool {
 	_, err := os.Stat(name)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false
-		}
-		panic(err)
+	if err == nil {
+		return true
 	}
-	return true
+	if errors.Is(err, fs.ErrNotExist) {
+		return false
+	}
+	panic(err)
 }
 
 func configHome() string {
 	configHome := os.Getenv("XDG_CONFIG_HOME")
-	if configHome == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			log.Fatal("Failed to get home directory:", err)
-		}
-		configHome = filepath.Join(home, ".config")
+	if configHome != "" {
+		return configHome
 	}
-	return configHome
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatal("Failed to get home directory:", err)
+	}
+	return filepath.Join(home, ".config")
 }
 
 func getInitFiloPath() string {
-	configHome := configHome()
-	return filepath.Join(configHome, "devmux", "init.filo")
-}
-
-// createConfigDir creates the config directory if it does not exist.
-func createConfigDir() {
-	configHome := configHome()
-	configDir := filepath.Join(configHome, "devmux")
-	_, err := os.Stat(configDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			err := os.MkdirAll(configDir, 0700)
-			if err != nil {
-				log.Fatal("Failed to create config directory:", err)
-			}
-			return
-		}
-		log.Fatal("Failed to check config directory:", err)
-	}
+	return filepath.Join(configHome(), "devmux", "init.filo")
 }
 
 func runFiloFile(name string) {
 	if !fileExists(name) {
-		//log.Fatalf("Config file %s not found", name)
 		return
 	}
 
-	// Create a new Filo interpreter.
 	f := filo.New()
 	defer f.Close()
 
@@ -103,7 +102,6 @@ func runFiloFile(name string) {
 	f.SetGlobal("RemotePort", remotePort)
 	f.SetGlobal("Routes", routes)
 
-	// Read the Filo file.
 	b, err := os.ReadFile(filepath.Clean(name))
 	if err != nil {
 		log.Fatal(err)
@@ -119,7 +117,47 @@ func runFiloFile(name string) {
 	routes = f.MustGetMap("Routes")
 }
 
-func dialSSH(user, host, sshKeyPath string) *ssh.Client {
+// sshTarget resolves alias through ~/.ssh/config the way ssh does: a missing
+// file or a missing Hostname means the alias is the host itself.
+func sshTarget(alias string) (addr, user, keyPath string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatalf("Failed to get home directory: %v", err)
+	}
+
+	// #nosec G304 -- the user's own ~/.ssh/config.
+	b, err := os.ReadFile(filepath.Join(home, ".ssh", "config"))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		log.Fatalf("failed to read SSH config: %v", err)
+	}
+	cfg, err := ssh_config.DecodeBytes(b)
+	if err != nil {
+		log.Fatalf("failed to decode SSH config: %v", err)
+	}
+
+	hostname, _ := cfg.Get(alias, "Hostname")
+	if hostname == "" {
+		hostname = alias
+	}
+	port, _ := cfg.Get(alias, "Port")
+	if port == "" {
+		port = "22"
+	}
+	user, _ = cfg.Get(alias, "User")
+	if user == "" {
+		user = os.Getenv("USER")
+	}
+	identity, _ := cfg.Get(alias, "IdentityFile")
+	keyPath = os.ExpandEnv(identity)
+	rest, ok := strings.CutPrefix(keyPath, "~")
+	if ok {
+		keyPath = home + rest
+	}
+
+	return net.JoinHostPort(hostname, port), user, keyPath
+}
+
+func dialSSH(user, addr, sshKeyPath string) *ssh.Client {
 	auth, err := agentAuth(sshKeyPath)
 	if err != nil {
 		log.Fatalf("auth: %v", err)
@@ -131,30 +169,51 @@ func dialSSH(user, host, sshKeyPath string) *ssh.Client {
 	}
 
 	cfg := &ssh.ClientConfig{
-		User:            user,
-		Auth:            []ssh.AuthMethod{auth},
-		HostKeyCallback: hostKeyCallback,
-		Timeout:         10 * time.Second,
+		User:              user,
+		Auth:              []ssh.AuthMethod{auth},
+		HostKeyCallback:   hostKeyCallback,
+		HostKeyAlgorithms: knownHostAlgorithms(hostKeyCallback, addr),
+		Timeout:           10 * time.Second,
 	}
-	c, err := ssh.Dial("tcp", host, cfg)
+	c, err := ssh.Dial("tcp", addr, cfg)
 	if err != nil {
 		log.Fatalf("ssh dial: %v", err)
 	}
 	return c
 }
 
-func loadPrivateKey(keyPath string) (ssh.Signer, error) {
-	// #nosec G304 -- keyPath is the user's own SSH key, from the config or the
-	// ssh_config lookup; reading it is exactly what the flag asks for.
-	key, err := os.ReadFile(keyPath)
+// knownHostAlgorithms lists the key types known_hosts holds for addr. Without
+// it the server may present a type that is not recorded (ecdsa when only
+// ed25519 is known) and knownhosts reports a mismatch where ssh would not.
+func knownHostAlgorithms(cb ssh.HostKeyCallback, addr string) []string {
+	pub, _, err := ed25519.GenerateKey(nil)
 	if err != nil {
-		return nil, err
+		return nil
 	}
-	return ssh.ParsePrivateKey(key)
+	probe, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		return nil
+	}
+	var keyErr *knownhosts.KeyError
+	if !errors.As(cb(addr, &net.TCPAddr{}, probe), &keyErr) {
+		return nil
+	}
+
+	var algos []string
+	for _, k := range keyErr.Want {
+		switch k.Key.Type() {
+		case ssh.KeyAlgoRSA:
+			algos = append(algos, ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256)
+		default:
+			algos = append(algos, k.Key.Type())
+		}
+	}
+	return algos
 }
 
 func agentAuth(sshKeyPath string) (ssh.AuthMethod, error) {
-	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+	sock := os.Getenv("SSH_AUTH_SOCK")
+	if sock != "" {
 		// #nosec G704 -- sock is the ssh-agent socket from the user's own
 		// environment, not a network address taken from any request.
 		conn, err := net.Dial("unix", sock)
@@ -163,11 +222,18 @@ func agentAuth(sshKeyPath string) (ssh.AuthMethod, error) {
 		}
 	}
 
-	signer, err := loadPrivateKey(sshKeyPath)
-	if err != nil {
-		log.Fatalf("Failed to load private key: %v", err)
+	if sshKeyPath == "" {
+		return nil, errors.New("no ssh-agent and no IdentityFile for this host")
 	}
-
+	// #nosec G304 -- sshKeyPath is the user's own SSH key from ssh_config.
+	key, err := os.ReadFile(sshKeyPath)
+	if err != nil {
+		return nil, err
+	}
+	signer, err := ssh.ParsePrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", sshKeyPath, err)
+	}
 	return ssh.PublicKeys(signer), nil
 }
 
@@ -183,46 +249,29 @@ func keepAlive(c *ssh.Client, every time.Duration) {
 	}
 }
 
-func mustParseURL(raw string) *url.URL {
-	u, err := url.Parse(raw)
-	if err != nil {
-		panic(err)
-	}
-	return u
-}
-
-// loggingResponseWriter is a wrapper for http.ResponseWriter that captures the status code and size of the response
 type loggingResponseWriter struct {
 	http.ResponseWriter
 	statusCode int
 	size       int
-	body       *bytes.Buffer
+	body       bytes.Buffer
 }
 
-// captures the status code
 func (lw *loggingResponseWriter) WriteHeader(code int) {
 	lw.statusCode = code
 	lw.ResponseWriter.WriteHeader(code)
 }
 
-// capture and count the size of the response body
 func (lw *loggingResponseWriter) Write(b []byte) (int, error) {
-	size, err := lw.ResponseWriter.Write(b)
-	lw.size += size
-	if lw.body != nil {
-		lw.body.Write(b)
-	}
-	return size, err
+	n, err := lw.ResponseWriter.Write(b)
+	lw.size += n
+	lw.body.Write(b[:min(n, maxLoggedBody-lw.body.Len())])
+	return n, err
 }
 
-func newLoggingResponseWriter(w http.ResponseWriter) *loggingResponseWriter {
-	// We check the Content-Type only at the time of writing
-	buf := &bytes.Buffer{}
-	return &loggingResponseWriter{
-		ResponseWriter: w,
-		statusCode:     http.StatusOK, // Default status code
-		body:           buf,
-	}
+// Unwrap lets ReverseProxy reach Flush and Hijack through the wrapper;
+// streaming responses and WebSocket upgrades fail without it.
+func (lw *loggingResponseWriter) Unwrap() http.ResponseWriter {
+	return lw.ResponseWriter
 }
 
 func formatBody(body []byte, contentType string) string {
@@ -230,28 +279,23 @@ func formatBody(body []byte, contentType string) string {
 		return "[Empty body]"
 	}
 
-	// Process www-form-urlencoded forms
 	if strings.Contains(contentType, "application/x-www-form-urlencoded") {
 		formValues, err := url.ParseQuery(string(body))
 		if err == nil {
 			var sb strings.Builder
 			sb.WriteString("[Form data]\n")
-
-			for key, values := range formValues {
-				fmt.Fprintf(&sb, ">>   %s: %s\n", key, strings.Join(values, ", "))
+			for _, key := range slices.Sorted(maps.Keys(formValues)) {
+				fmt.Fprintf(&sb, ">>   %s: %s\n", key, strings.Join(formValues[key], ", "))
 			}
 			return sb.String()
 		}
-		// If parsing fails, fall back to default behavior
 	}
 
-	// Process multipart/form-data (without showing binary data)
 	if strings.Contains(contentType, "multipart/form-data") {
-		return fmt.Sprintf("[Multipart form - Size: %v bytes]\nContent-Type: %s",
+		return fmt.Sprintf("[Multipart form - Size: %d bytes]\nContent-Type: %s",
 			len(body), contentType)
 	}
 
-	// Process other readable content types
 	if strings.Contains(contentType, "text") ||
 		strings.Contains(contentType, "xml") ||
 		strings.Contains(contentType, "json") ||
@@ -259,59 +303,58 @@ func formatBody(body []byte, contentType string) string {
 		return string(body)
 	}
 
-	// Binary or unknown data
-	return fmt.Sprintf("[Binary content - Content-Type: %s - Size: 0x%X bytes]",
+	return fmt.Sprintf("[Binary content - Content-Type: %s - Size: %d bytes]",
 		contentType,
 		len(body))
 }
 
+// captureRequestBody reads up to maxLoggedBody for the log and puts it back in
+// front of the rest, so the backend still receives the whole body.
 func captureRequestBody(r *http.Request) ([]byte, error) {
-	if r.Body == nil {
-		return nil, nil
-	}
-
-	bodyBytes, err := io.ReadAll(r.Body)
+	head, err := io.ReadAll(io.LimitReader(r.Body, maxLoggedBody))
 	if err != nil {
 		return nil, err
 	}
-
-	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-	return bodyBytes, nil
+	r.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(head), r.Body), r.Body}
+	return head, nil
 }
 
-// captureRequestLog formats request information and returns it as a string
+func writeHeaders(sb *strings.Builder, prefix string, h http.Header) {
+	for _, key := range slices.Sorted(maps.Keys(h)) {
+		fmt.Fprintf(sb, "%s   %s: %s\n", prefix, key, strings.Join(h[key], ", "))
+	}
+}
+
 func captureRequestLog(r *http.Request, routeKey string, target string) string {
 	var sb strings.Builder
 
-	fmt.Fprintf(&sb, "\n%s>> REQUEST RECEIVED%s\n",
-		colorGreen, colorReset)
+	fmt.Fprintf(&sb, "\n%s>> REQUEST RECEIVED%s\n", colorGreen, colorReset)
 	fmt.Fprintf(&sb, "%s>> Route:%s %s → %s\n", colorGreen, colorReset, routeKey, target)
 	fmt.Fprintf(&sb, "%s>> Method:%s %s\n", colorGreen, colorReset, r.Method)
 	fmt.Fprintf(&sb, "%s>> URL:%s %s%s\n", colorGreen, colorReset, r.Host, r.URL.String())
-
 	fmt.Fprintf(&sb, "%s>> Headers:%s\n", colorGreen, colorReset)
-	for key, values := range r.Header {
-		fmt.Fprintf(&sb, ">>   %s: %s\n", key, strings.Join(values, ", "))
-	}
+	writeHeaders(&sb, ">>", r.Header)
 
-	bodyBytes, err := captureRequestBody(r)
+	body, err := captureRequestBody(r)
 	if err != nil {
 		fmt.Fprintf(&sb, ">>   [Error reading body: %v]\n", err)
-	} else if len(bodyBytes) > 0 {
-		contentType := r.Header.Get("Content-Type")
+		return sb.String()
+	}
+	if len(body) > 0 {
 		fmt.Fprintf(&sb, "%s>> Body:%s\n", colorGreen, colorReset)
-		fmt.Fprintf(&sb, ">>   %s\n", formatBody(bodyBytes, contentType))
+		fmt.Fprintf(&sb, ">>   %s\n", formatBody(body, r.Header.Get("Content-Type")))
 	}
 
 	return sb.String()
 }
 
-// captureResponseLog formats response information and returns it as a string
 func captureResponseLog(w *loggingResponseWriter, duration time.Duration) string {
 	var sb strings.Builder
 
-	fmt.Fprintf(&sb, "\n%s<< RESPONSE SENT%s\n",
-		colorYellow, colorReset)
+	fmt.Fprintf(&sb, "\n%s<< RESPONSE SENT%s\n", colorYellow, colorReset)
 	fmt.Fprintf(&sb, "%s<< Status:%s %d %s\n",
 		colorYellow,
 		colorReset,
@@ -319,256 +362,167 @@ func captureResponseLog(w *loggingResponseWriter, duration time.Duration) string
 		http.StatusText(w.statusCode))
 	fmt.Fprintf(&sb, "%s<< Size:%s %d bytes\n", colorYellow, colorReset, w.size)
 	fmt.Fprintf(&sb, "%s<< Duration:%s %v\n", colorYellow, colorReset, duration)
-
 	fmt.Fprintf(&sb, "%s<< Headers:%s\n", colorYellow, colorReset)
-	for key, values := range w.Header() {
-		fmt.Fprintf(&sb, "<<   %s: %s\n", key, strings.Join(values, ", "))
-	}
+	writeHeaders(&sb, "<<", w.Header())
 
-	if w.body != nil && w.body.Len() > 0 {
-		contentType := w.Header().Get("Content-Type")
+	if w.body.Len() > 0 {
 		fmt.Fprintf(&sb, "%s<< Body:%s\n", colorYellow, colorReset)
-		fmt.Fprintf(&sb, "<<   %s\n", formatBody(w.body.Bytes(), contentType))
+		fmt.Fprintf(&sb, "<<   %s\n", formatBody(w.body.Bytes(), w.Header().Get("Content-Type")))
 	}
 
 	return sb.String()
 }
 
-// loggingHandler is a middleware that intercepts requests and responses for logging
 func loggingHandler(routeKey string, target string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
-		// Create a buffer to capture log output
-		var logBuffer bytes.Buffer
-
-		// Log request to console and capture for file
 		requestLog := captureRequestLog(r, routeKey, target)
 		fmt.Print(requestLog)
-		logBuffer.WriteString(stripAnsiCodes(requestLog))
 
-		// Process the request
-		lw := newLoggingResponseWriter(w)
+		lw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(lw, r)
 
-		// Calculate duration
-		duration := time.Since(start)
-
-		// Log response to console and capture for file
-		responseLog := captureResponseLog(lw, duration)
+		responseLog := captureResponseLog(lw, time.Since(start))
 		fmt.Print(responseLog)
-		logBuffer.WriteString(stripAnsiCodes(responseLog))
 
-		// Create log file with the combined log content
-		logPath := logFilePath(routeKey)
-		if err := writeToLogFile(logPath, logBuffer.String()); err != nil {
+		err := writeToLogFile(logFilePath(routeKey), ansiStripper.Replace(requestLog+responseLog))
+		if err != nil {
 			log.Printf("Failed to write log file: %v", err)
 		}
 	})
 }
 
-// logFilePath generates a file path for the log file based on the route and current time
 func logFilePath(routeKey string) string {
-	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
-	timestamp = strings.ReplaceAll(timestamp, ":", "-")
-
-	// Create logs directory if it doesn't exist
-	logsDir := "./logs"
-	_, err := os.Stat(logsDir)
+	logsDir := "logs"
+	err := os.MkdirAll(logsDir, 0700)
 	if err != nil {
-		if os.IsNotExist(err) {
-			err := os.Mkdir(logsDir, 0700)
-			if err != nil {
-				log.Printf("Failed to create logs directory: %v", err)
-				logsDir = "."
+		log.Printf("Failed to create logs directory: %v", err)
+		logsDir = "."
+	}
+
+	timestamp := strings.ReplaceAll(time.Now().UTC().Format(time.RFC3339Nano), ":", "-")
+	name := strings.ReplaceAll(routeKey, "/", "_")
+	return filepath.Join(logsDir, name+"-"+timestamp+".log")
+}
+
+// writeToLogFile is 0600: the log holds request headers, cookies and tokens
+// included.
+func writeToLogFile(filePath string, content string) error {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	content = strings.ReplaceAll(content, "\r", "\n")
+	// #nosec G703 -- filePath comes from logFilePath: logs dir, a route key from
+	// the config and a timestamp; nothing in it comes from the request.
+	return os.WriteFile(filePath, []byte(content), 0600)
+}
+
+func routeNotFound(w http.ResponseWriter, r *http.Request) {
+	errorMsg := fmt.Sprintf("\n%s!! ROUTE NOT FOUND%s: %s\n", colorRed, colorReset, r.URL.Path)
+	fmt.Print(errorMsg)
+
+	err := writeToLogFile(logFilePath("error"), ansiStripper.Replace(errorMsg))
+	if err != nil {
+		log.Printf("write error log: %v", err)
+	}
+
+	http.NotFound(w, r)
+}
+
+// newRouter builds one reverse proxy per route. A request goes to the route
+// with the longest matching path prefix, with that prefix stripped.
+func newRouter(routes map[string]string) (http.Handler, error) {
+	proxies := make(map[string]http.Handler, len(routes))
+	for key, port := range routes {
+		_, err := strconv.ParseUint(port, 10, 16)
+		if err != nil {
+			return nil, fmt.Errorf("route %q: invalid port %q", key, port)
+		}
+		key = strings.Trim(key, "/")
+		target := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", port)}
+		proxy := httputil.NewSingleHostReverseProxy(target)
+		proxy.ErrorLog = log.Default()
+		proxies[key] = loggingHandler(key, target.String(), proxy)
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seg := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
+		for i := len(seg); i > 0; i-- {
+			h, ok := proxies[strings.Join(seg[:i], "/")]
+			if !ok {
+				continue
 			}
+			r.URL.Path = "/" + strings.Join(seg[i:], "/")
+			r.URL.RawPath = ""
+			h.ServeHTTP(w, r)
+			return
 		}
-	}
-
-	// Return the full path including directory
-	return filepath.Join(logsDir, fmt.Sprintf("%s-%s.log", routeKey, timestamp))
+		routeNotFound(w, r)
+	}), nil
 }
 
-// writeToLogFile writes the log content to a file
-func writeToLogFile(filePath string, content string) (err error) {
-	// #nosec G304 -- filePath is built by logFilePath from the logs dir, the
-	// route key and a timestamp; nothing in it comes from the request.
-	f, err := os.Create(filePath)
-	if err != nil {
-		return err
-	}
-	// A failed Close on a written file means a truncated log, so it has to
-	// reach the caller instead of disappearing in a bare defer.
-	defer func() {
-		cerr := f.Close()
-		if err == nil {
-			err = cerr
-		}
-	}()
+func usage() {
+	fmt.Printf(`Usage: devmux
 
-	// Normalize line endings to just \n (Unix style)
-	// First replace Windows style (\r\n) with Unix style (\n)
-	normalizedContent := strings.ReplaceAll(content, "\r\n", "\n")
-	// Then replace any remaining old Mac style line endings (\r) with Unix style (\n)
-	normalizedContent = strings.ReplaceAll(normalizedContent, "\r", "\n")
+Open a reverse SSH tunnel to Host and route the HTTP requests that arrive on
+its loopback RemotePort to local ports by path prefix.
 
-	_, err = f.WriteString(normalizedContent)
-	return err
-}
+Config: ./devmux_init.filo, else %s
+  (set Host "my-vps")          ;; alias or host, resolved via ~/.ssh/config
+  (set RemotePort "10000")     ;; default 10000
+  (set Routes (list (tuple "api" "3000") (tuple "web" "8080")))
 
-// stripAnsiCodes removes ANSI color codes from a string
-func stripAnsiCodes(s string) string {
-	// ANSI escape code pattern
-	r := strings.NewReplacer(
-		colorReset, "",
-		colorRed, "",
-		colorGreen, "",
-		colorYellow, "",
-		colorBlue, "",
-		colorPurple, "",
-		colorCyan, "",
-		colorWhite, "",
-	)
-	return r.Replace(s)
+Requests and responses are printed to stdout and saved one per file in ./logs.
+
+Example: with the config above, https://my-vps/api/users -> 127.0.0.1:3000/users
+`, getInitFiloPath())
 }
 
 func main() {
+	flag.Usage = usage
+	flag.Parse()
+
 	log.SetFlags(log.LstdFlags | log.Llongfile)
 
-	createConfigDir()
 	initFile := getInitFiloPath()
-
-	if fileExists("./devmux_init.filo") {
-		initFile = "./devmux_init.filo"
+	if fileExists("devmux_init.filo") {
+		initFile = "devmux_init.filo"
 	}
-
-	//key := filepath.Join(os.Getenv("HOME"), ".ssh", "id_rsa")
-
 	runFiloFile(initFile)
+	if host == "" {
+		log.Fatalf("Host not set: create %s or ./devmux_init.filo (see devmux -h)", getInitFiloPath())
+	}
 
-	///////////////////////////////
-	// Read key, user, host, from init.filo or ~/.ssh/config
-
-	sshPort := "22"
-
-	configPath := os.ExpandEnv("$HOME/.ssh/config")
-	f, err := os.Open(filepath.Clean(configPath))
+	handler, err := newRouter(routes)
 	if err != nil {
-		log.Fatalf("failed to open SSH config: %v", err.Error())
-	}
-	sshCfg, err := ssh_config.Decode(f)
-	if err != nil {
-		log.Fatalf("failed to decode SSH config: %v", err.Error())
-	}
-	_ = f.Close()
-
-	sshUser, _ := sshCfg.Get(host, "User")
-	if sshUser == "" {
-		sshUser = os.Getenv("USER")
-	}
-	hostname, _ := sshCfg.Get(host, "Hostname")
-	if hostname == "" {
-		log.Fatalf("no Hostname found for alias %s in SSH config", host)
-	}
-	if port, _ := sshCfg.Get(host, "Port"); port != "" {
-		sshPort = port
-	}
-	sshKeyPath := ""
-	if identity, _ := sshCfg.Get(host, "IdentityFile"); identity != "" {
-		sshKeyPath = os.ExpandEnv(identity)
+		log.Fatal(err)
 	}
 
-	if strings.HasPrefix(sshKeyPath, "~") {
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			log.Fatalf("Failed to get home directory: %v", err)
-		}
-		sshKeyPath = strings.Replace(sshKeyPath, "~", homeDir, 1)
-	}
-
-	if sshPort != "" {
-		hostname = fmt.Sprintf("%s:%s", hostname, sshPort)
-	}
-
-	sshClient := dialSSH(sshUser, hostname, sshKeyPath)
+	addr, sshUser, sshKeyPath := sshTarget(host)
+	sshClient := dialSSH(sshUser, addr, sshKeyPath)
 	defer func() { _ = sshClient.Close() }()
 	go keepAlive(sshClient, 30*time.Second)
 
-	// 1. ask the server to listen on
 	ln, err := sshClient.Listen("tcp", "127.0.0.1:"+remotePort)
 	if err != nil {
 		log.Fatalf("remote listen %s: %v", remotePort, err)
 	}
 	fmt.Printf("%s✓%s Remote port %s%s%s open on VPS (loopback)\n", colorGreen, colorReset, colorCyan, remotePort, colorReset)
 
-	// 2. listen on local port
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seg := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
-		if len(seg) == 0 || seg[0] == "" {
-			// Create error message for route not found
-			errorMsg := fmt.Sprintf("\n%s!! ROUTE NOT FOUND%s: %s\n", colorRed, colorReset, r.URL.Path)
-			fmt.Print(errorMsg)
-
-			// Log the error to a file (using "error" as the route key)
-			errorLogPath := logFilePath("error")
-			werr := writeToLogFile(errorLogPath, stripAnsiCodes(errorMsg))
-			if werr != nil {
-				log.Printf("write error log: %v", werr)
-			}
-
-			http.NotFound(w, r)
-			return
-		}
-		port, ok := routes[seg[0]]
-		if !ok {
-			// Create error message for route not found
-			errorMsg := fmt.Sprintf("\n%s!! ROUTE NOT FOUND%s: %s\n", colorRed, colorReset, seg[0])
-			fmt.Print(errorMsg)
-
-			// Log the error to a file (using "error" as the route key)
-			errorLogPath := logFilePath("error")
-			werr := writeToLogFile(errorLogPath, stripAnsiCodes(errorMsg))
-			if werr != nil {
-				log.Printf("write error log: %v", werr)
-			}
-
-			http.NotFound(w, r)
-			return
-		}
-
-		routeKey := seg[0]
-		// strip first segment
-		r.URL.Path = "/" + strings.Join(seg[1:], "/")
-		target := "http://127.0.0.1:" + port
-
-		proxy := httputil.NewSingleHostReverseProxy(mustParseURL(target))
-		proxy.ErrorLog = log.Default()
-
-		// Use the middleware to log the request and response
-		loggingHandler(routeKey, target, proxy).ServeHTTP(w, r)
-	})
-
 	// ReadHeaderTimeout bounds a client that opens a connection and dribbles
 	// headers forever (Slowloris). devmux listens on loopback, but the far end
 	// of the tunnel is a port open on the VPS.
-	server := http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 
-	// Handle graceful shutdown on CTRL-C/SIGTERM
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	drained := make(chan struct{})
 	go func() {
-		s := <-sig
-		fmt.Printf("\n%sReceived signal %v, shutting down...%s\n", colorYellow, s, colorReset)
-
-		// Close listener and SSH connections
-		fmt.Printf("%sClosing network connections...%s\n", colorYellow, colorReset)
-		_ = ln.Close()
-
-		fmt.Printf("%sClosing SSH tunnel...%s\n", colorYellow, colorReset)
-		_ = sshClient.Close()
-
-		fmt.Printf("%sShutdown complete. Goodbye!%s\n", colorGreen, colorReset)
-		os.Exit(0)
+		defer close(drained)
+		<-ctx.Done()
+		fmt.Printf("\n%sShutting down...%s\n", colorYellow, colorReset)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
 	}()
 
 	fmt.Printf("%s→%s VPS reverse proxy port %s%s%s %s➜%s SSH %s➜%s devmux %s➜%s local ports\n",
@@ -577,9 +531,10 @@ func main() {
 		colorGreen, colorReset,
 		colorGreen, colorReset,
 		colorGreen, colorReset)
-	if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
-		if err != http.ErrServerClosed {
-			log.Fatalf("Failed to start server: %v", err)
-		}
+	err = server.Serve(ln)
+	if !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("serve: %v", err)
 	}
+	<-drained
+	fmt.Printf("%sShutdown complete. Goodbye!%s\n", colorGreen, colorReset)
 }

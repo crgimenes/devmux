@@ -1,6 +1,6 @@
 # devmux - Development Multiplexer
 
-[![Go Version](https://img.shields.io/badge/Go-1.24+-blue.svg)](https://golang.org/doc/install)
+[![Go Version](https://img.shields.io/badge/Go-1.27+-blue.svg)](https://golang.org/doc/install)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A powerful reverse tunnel proxy tool that creates secure tunnels to remote servers and intelligently routes HTTP requests to local development ports. Perfect for exposing multiple local services through a single remote endpoint.
@@ -27,7 +27,7 @@ go build -o devmux .
 
 ### Requirements
 
-• Go 1.24 or higher
+• Go 1.27 or higher
 • SSH access to a remote server
 • SSH key configured for authentication
 
@@ -135,6 +135,9 @@ devmux respects your SSH configuration and supports:
 • **SSH Config**: Uses `~/.ssh/config` for host-specific settings
 • **Known Hosts**: Validates server identity using `~/.ssh/known_hosts`
 • **Key Files**: Direct SSH key file specification
+
+`Host` in the config is looked up in `~/.ssh/config`; without a matching
+`Hostname` it is used as the host name itself, and the port defaults to 22.
 
 ### Example SSH Config
 
