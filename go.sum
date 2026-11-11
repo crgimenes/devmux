@@ -1,5 +1,7 @@
 github.com/crgimenes/filo v0.1.2 h1:CdaVjCEH6vrXrVhkz2XM9U1wguPP1OA/VkX/vd+W8Ng=
 github.com/crgimenes/filo v0.1.2/go.mod h1:OG6ZeGyGFfLBbXbgrdRzVdTzUCMLh1hk9k9WTs6cyhE=
+github.com/crgimenes/filo-term-go v0.0.3 h1:cPNJgR0HEjZBlK9A41usbd3m5uEFeDoFNQGhUC3ldwY=
+github.com/crgimenes/filo-term-go v0.0.3/go.mod h1:rKpsQ9CbHdnETWAgXySYJKgWCfWAOSOinwhTe7rtCbE=
 github.com/kevinburke/ssh_config v1.6.0 h1:J1FBfmuVosPHf5GRdltRLhPJtJpTlMdKTBjRgTaQBFY=
 github.com/kevinburke/ssh_config v1.6.0/go.mod h1:q2RIzfka+BXARoNexmF9gkxEX7DmvbW9P4hIVx2Kg4M=
 golang.org/x/crypto v0.58.0 h1:COkYLr4k7nDI4r6QtMML2AfzeIswWHAJthLS6K/M/54=

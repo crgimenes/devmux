@@ -27,7 +27,7 @@ draft
 .DS_Store
 .vscode
 todo.md
-devmux
+/devmux
 release.sh
 dist
 *.sql

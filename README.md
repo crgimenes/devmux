@@ -7,17 +7,15 @@ A powerful reverse tunnel proxy tool that creates secure tunnels to remote serve
 
 ## Features
 
-- **Secure SSH Tunneling**: Create encrypted reverse tunnels using SSH with key-based authentication.
-- **Intelligent HTTP Routing**: Route requests to different local ports based on URL paths.
-- **Filo Configuration**: Flexible configuration system using the [Filo](https://github.com/crgimenes/filo) scripting language.
-- **Request Logging**: Detailed logging of HTTP requests with colored output for better debugging.
-- **SSH Agent Support**: Seamless integration with SSH agent for key management.
-- **Multi-Service Support**: Expose multiple local development services through one tunnel.
-- **Keep-Alive**: Automatic connection maintenance to prevent tunnel timeouts.
+- **Several tunnels at once**: each one is an SSH session to its own host that opens a loopback port there; switch tunnels and single routes on and off while it runs.
+- **Path routing**: requests go to local ports by path prefix; the longest prefix wins and is stripped.
+- **Request inspector**: a screen that lists the requests as they arrive and opens headers and bodies of the request and the response (JSON indented).
+- **CLI for scripts and AI agents**: `devmux ls`, `devmux requests`, `devmux request ID`, with `-json`; a Claude Code skill ships in `skills/devmux`.
+- **Reconnects on its own**: a dropped session comes back with backoff (1 s to 30 s).
+- **SSH as you have it**: `~/.ssh/config`, ssh-agent, `known_hosts` checked.
+- **Filo configuration**: [Filo](https://github.com/crgimenes/filo) scripting language.
 
 ## Installation
-
-### From Source
 
 ```bash
 git clone https://github.com/crgimenes/devmux.git
@@ -25,106 +23,78 @@ cd devmux
 go build -o devmux .
 ```
 
-### Requirements
-
-• Go 1.27 or higher
-• SSH access to a remote server
-• SSH key configured for authentication
+Requirements: Go 1.27 or higher, SSH access to a remote server, a key in
+ssh-agent or an `IdentityFile`.
 
 ## Quick Start
 
-1. **Create your configuration file**:
+1. Put the remote side's web server in front of the loopback port. Caddy
+   (`/etc/caddy/Caddyfile`):
 
-   ```bash
-   mkdir -p ~/.config/devmux
+   ```
+   server.example.com {
+   	reverse_proxy 127.0.0.1:10000
+   }
    ```
 
-2. **Configure your routes** (`~/.config/devmux/init.filo`):
+2. Declare the tunnel in `~/.config/devmux/init.filo` (or
+   `./devmux_init.filo`, or any file with `-config FILE`):
 
    ```scheme
-   (set Host "your-server.com")
-   (set RemotePort "10000")
-   (set Routes (list
-       (tuple "api"   "3000")    ;; Routes /api to localhost:3000
-       (tuple "web"   "8080")    ;; Routes /web to localhost:8080
-       (tuple "admin" "9000")))  ;; Routes /admin to localhost:9000
+   ;; (tunnel NAME HOST REMOTE-PORT ROUTES)
+   (tunnel "dev" "server.example.com" "10000"
+     (list
+       (tuple "api"    "3000")    ;; /api/...    -> 127.0.0.1:3000/...
+       (tuple "api/v2" "3002")    ;; /api/v2/... -> 127.0.0.1:3002/...
+       (tuple "web"    "8080")))  ;; /web/...    -> 127.0.0.1:8080/...
    ```
 
-3. **Start the tunnel**:
+   `HOST` is an `~/.ssh/config` alias or a host name. Declare as many
+   tunnels as you like; names must be unique. The older form with the
+   `Host`, `RemotePort` and `Routes` globals is still read, as one tunnel
+   named after its host.
+
+3. Run `devmux` and press space on the tunnel, or serve it with no screen:
 
    ```bash
-   ./devmux
+   devmux run dev
    ```
 
-4. **Access your services**:
-   - `http://your-server.com:10000/api` → `localhost:3000`
-   - `http://your-server.com:10000/web` → `localhost:8080`
-   - `http://your-server.com:10000/admin` → `localhost:9000`
+4. `https://server.example.com/api/users` now reaches `127.0.0.1:3000/users`.
 
-## Configuration
+## The screen
 
-devmux uses [Filo](https://github.com/crgimenes/filo) for configuration, providing powerful customization options. The configuration file should be placed at `~/.config/devmux/init.filo` or as `devmux_init.filo` in your current directory.
+`devmux` with no command opens it. All tunnels start off.
 
-### Basic Configuration
+| Screen | Keys |
+|---|---|
+| tunnels | space on/off, enter routes, r requests, q quit |
+| routes of a tunnel | space switches the route (an off route answers 503), r requests; shows whether something listens on each local port |
+| requests | newest first, live; enter opens one |
+| request | headers and bodies, ↑↓ PgUp PgDn to scroll; esc goes back |
 
-Configure your remote server with a reverse proxy to a port.
+Quitting closes the tunnels, waiting a few seconds for requests in flight.
 
-Caddyfile example `/etc/caddy/Caddyfile`:
+## Command line
 
 ```
-server.example.com {
-	reverse_proxy 127.0.0.1:10000
-}
+devmux ls [-json]                         tunnels, and which are up in which process
+devmux requests [-tunnel N] [-n 20] [-json]
+devmux request [-json] ID
+devmux run [NAME...]                      all tunnels, or those named; requests on stdout
 ```
 
-Local configuration file (`~/.config/devmux/init.filo`):
+Every request is appended as one JSON line to
+`~/.local/state/devmux/logs/<tunnel>-<date>.jsonl` (`$XDG_STATE_HOME` is
+honoured), mode 0600: they hold headers, tokens included. Each running
+devmux writes its tunnels' state to `~/.local/state/devmux/run/<pid>.json`,
+which `devmux ls` reads. Bodies are kept up to 64 KiB in the log; what goes
+to the service is never cut.
 
-```scheme
-;; Remote server settings
-(set Host "your-remote-server.com")
-(set RemotePort "10000")
+For Claude Code, link the skill:
 
-;; Route configuration
-(set Routes (list
-    (tuple "api"     "3000")    ;; API service on port 3000
-    (tuple "web"     "8080")    ;; Web frontend on port 8080
-    (tuple "docs"    "4000")    ;; Documentation on port 4000
-    (tuple "metrics" "9090")))  ;; Monitoring on port 9090
-```
-
-### Route Patterns
-
-Routes are defined as path prefixes that map to local ports:
-
-```scheme
-(set Routes (list
-    (tuple "app"       "3000")    ;; /app/* → localhost:3000/*
-    (tuple "api/v1"    "8001")    ;; /api/v1/* → localhost:8001/*
-    (tuple "api/v2"    "8002")    ;; /api/v2/* → localhost:8002/*
-    (tuple "static"    "8080")    ;; /static/* → localhost:8080/*
-    (tuple "websocket" "3001")))  ;; /websocket/* → localhost:3001/*
-```
-
-## How It Works
-
-1. **The remote http server** listens http and https requests and redirects them to the 10000 port.
-2. **SSH Tunnel Creation**: devmux establishes a reverse SSH tunnel to your remote server at port 10000.
-3. **HTTP Proxy Server**: A local HTTP server captures incoming requests from the tunnel
-4. **Route Matching**: Requests are analyzed and routed based on URL path prefixes
-5. **Local Forwarding**: Matched requests are proxied to the corresponding local port
-6. **Response Relay**: Responses are sent back through the tunnel to the client
-
-## Use Cases
-
-### Development Environment Exposure
-
-Expose your local development stack to remote collaborators or testing environments:
-
-```scheme
-(set Routes (list
-    (tuple "frontend" "3000")    ;; React/Vue/Angular dev server
-    (tuple "backend"  "8000")    ;; API server
-    (tuple "db-admin" "8080")))  ;; Database administration tool
+```bash
+ln -s "$PWD/skills/devmux" ~/.claude/skills/devmux
 ```
 
 ## SSH Configuration

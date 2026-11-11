@@ -1,12 +1,17 @@
 ;;; devmux configuration - Filo format
 ;;; Copy this file to ~/.config/devmux/init.filo or ./devmux_init.filo
 
-(set Host "util.crg.eti.br")   ;; SSH alias / host of the remote VPS
-(set RemotePort "10000")       ;; loopback port opened on the remote side
+;; (tunnel NAME HOST REMOTE-PORT ROUTES)
+;; HOST is an ~/.ssh/config alias or a host name; REMOTE-PORT opens on the
+;; remote side's loopback. Each route maps a path prefix to a local port; the
+;; longest matching prefix wins and is stripped before the request goes on.
+(tunnel "util" "util.crg.eti.br" "10000"
+  (list
+    (tuple "ip"   "8001")
+    (tuple "dump" "8080")
+    (tuple "bbs"  "2020")))
 
-;; Routes map path segment -> local port. Written as a list of (key value)
-;; tuples, which devmux reads back as a string map.
-(set Routes (list
-  (tuple "ip"   "8001")
-  (tuple "dump" "8080")
-  (tuple "bbs"  "2020")))
+(tunnel "gauss" "gauss" "10100"
+  (list
+    (tuple "api"    "3000")
+    (tuple "api/v1" "3001")))
