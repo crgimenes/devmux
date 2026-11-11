@@ -121,6 +121,11 @@ func knownHostAlgorithms(cb ssh.HostKeyCallback, addr string) []string {
 
 	var algos []string
 	for _, k := range keyErr.Want {
+		if certAuthority(k) {
+			// The key is a CA's, not the host's: the host shows a
+			// certificate of any type, so the negotiation stays open.
+			return nil
+		}
 		switch k.Key.Type() {
 		case ssh.KeyAlgoRSA:
 			algos = append(algos, ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256)
@@ -157,4 +162,18 @@ func agentAuth(sshKeyPath string) (ssh.AuthMethod, func(), error) {
 		return nil, nil, fmt.Errorf("parse %s: %w", sshKeyPath, err)
 	}
 	return ssh.PublicKeys(signer), func() {}, nil
+}
+
+// certAuthority says whether k came from an @cert-authority line. KeyError
+// does not say, but it gives the file and line.
+func certAuthority(k knownhosts.KnownKey) bool {
+	b, err := os.ReadFile(filepath.Clean(k.Filename)) // #nosec G304 -- the known_hosts devmux opened
+	if err != nil {
+		return false
+	}
+	lines := strings.Split(string(b), "\n")
+	if k.Line < 1 || k.Line > len(lines) {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(lines[k.Line-1]), "@cert-authority")
 }

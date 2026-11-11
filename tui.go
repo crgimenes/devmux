@@ -66,6 +66,7 @@ func cmdScreen(config string) int {
 		warnf("%v", err)
 		return 1
 	}
+	defer func() { _ = t.Close() }() // a panic must not leave the shell raw
 	s := newSession("screen", configFile(config), confs, false)
 	a := &app{t: t, c: screen.New(t.Size()), s: s}
 	go s.watchConfig()
@@ -426,6 +427,8 @@ func (v *requestsView) hints() []kit.Hint {
 // refresh takes what arrived since and keeps the cursor on its request.
 func (v *requestsView) refresh(a *app) {
 	v.shown = a.s.rec.list(v.tunnel)
+	// the request under the cursor may have left the ring
+	v.tab.Cursor = max(0, min(v.tab.Cursor, len(v.shown)-1))
 	for i, ex := range v.shown {
 		if ex.ID == v.at {
 			v.tab.Cursor = i
@@ -442,7 +445,7 @@ func (v *requestsView) draw(a *app, c *screen.Canvas, top, left, rows, cols int)
 	tcols := kit.FillCols([]kit.Col{{Header: "time", Width: 8}, {Header: "tunnel", Width: 10}, {Header: "method", Width: 7}, {Header: "status", Width: 6}, {Header: "ms", Width: 8}, {Header: "url"}}, cols)
 	v.tab.Draw(c, top, left, tcols, len(v.shown), func(i int) []string {
 		ex := v.shown[i]
-		return []string{ex.Time.Format("15:04:05"), ex.Tunnel, ex.Method, fmt.Sprint(ex.Status), fmt.Sprintf("%.1f", ex.MS), ex.URL}
+		return []string{ex.Time.Format("15:04:05"), ex.Tunnel, printable(ex.Method), fmt.Sprint(ex.Status), fmt.Sprintf("%.1f", ex.MS), printable(ex.URL)}
 	}, rows-2)
 	v.at = v.shown[v.tab.Cursor].ID
 }

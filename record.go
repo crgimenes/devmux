@@ -82,7 +82,17 @@ type recorder struct {
 	mu   sync.Mutex
 	ring []exchange
 	last int64
+	full map[string]bool // files past maxLogFile, reported once
 }
+
+// Whoever reaches the remote port writes these logs, so they are bounded:
+// per tunnel and day, and in age.
+const (
+	maxLogFileDefault = 256 << 20
+	logKeep           = 14 * 24 * time.Hour
+)
+
+var maxLogFile int64 = maxLogFileDefault // a var so a test can make it small
 
 func (r *recorder) add(ex exchange) {
 	r.mu.Lock()
@@ -126,8 +136,35 @@ func (r *recorder) write(ex exchange) error {
 	if err != nil {
 		return err
 	}
+	info, err := f.Stat()
+	if err == nil && info.Size() >= maxLogFile {
+		_ = f.Close()
+		if r.full[name] {
+			return nil
+		}
+		if r.full == nil {
+			r.full = map[string]bool{}
+		}
+		r.full[name] = true
+		return fmt.Errorf("%s reached %d MiB; requests to %s are not logged until tomorrow", name, maxLogFile>>20, ex.Tunnel)
+	}
 	_, err = f.Write(append(b, '\n'))
 	return errors.Join(err, f.Close())
+}
+
+// pruneLogs removes the logs older than logKeep.
+func pruneLogs(dir string) error {
+	files, err := logFiles(dir)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, fi := range files {
+		if time.Since(fi.ModTime()) > logKeep {
+			errs = append(errs, os.Remove(filepath.Join(dir, fi.Name())))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // list is the exchanges kept, newest first, of one tunnel or all ("").
@@ -194,8 +231,8 @@ func readLog(file string, fn func(exchange) bool) error {
 }
 
 // recentExchanges is the newest n exchanges in dir, of one tunnel or all
-// (""), newest first. It stops reading once the files left are all older
-// than what it has.
+// (""), newest first; n must be at least 1. It stops reading once the
+// files left are all older than what it has.
 func recentExchanges(dir, tunnel string, n int) ([]exchange, error) {
 	files, err := logFiles(dir)
 	if err != nil {
@@ -209,17 +246,25 @@ func recentExchanges(dir, tunnel string, n int) ([]exchange, error) {
 		if tunnel != "" && !strings.HasPrefix(fi.Name(), tunnel+"-") {
 			continue
 		}
+		// A file is in time order: only its last n lines can count, so no
+		// more than 2n are held however big the file is.
+		var tail []exchange
 		err = readLog(filepath.Join(dir, fi.Name()), func(ex exchange) bool {
-			if tunnel == "" || ex.Tunnel == tunnel {
-				got = append(got, ex)
+			if tunnel != "" && ex.Tunnel != tunnel {
+				return true
+			}
+			tail = append(tail, ex)
+			if len(tail) >= 2*n {
+				tail = slices.Clone(tail[len(tail)-n:])
 			}
 			return true
 		})
 		if err != nil {
 			return nil, err
 		}
+		got = append(got, tail[max(0, len(tail)-n):]...)
 		slices.SortFunc(got, func(a, b exchange) int { return b.Time.Compare(a.Time) })
-		got = got[:min(len(got), max(n, 0))]
+		got = slices.Clone(got[:min(len(got), n)])
 	}
 	return got, nil
 }

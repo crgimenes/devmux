@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -21,9 +22,12 @@ const (
 )
 
 const (
-	keepAliveEvery = 30 * time.Second
-	retryMax       = 30 * time.Second
-	configPoll     = 2 * time.Second
+	keepAliveEvery    = 30 * time.Second
+	keepAliveTimeout  = 15 * time.Second
+	retryMax          = 30 * time.Second
+	configPoll        = 2 * time.Second
+	readHeaderTimeout = 10 * time.Second
+	drainTimeout      = 5 * time.Second
 )
 
 type tunnelStatus struct {
@@ -85,8 +89,8 @@ func (t *tunnel) setRoutes(routes []route, from, to string) {
 		}
 	}
 	h := newRouter(t.conf, t.routeOn, t.rec)
+	t.handler.Store(&h) // under mu: a slower swap cannot land after a newer one
 	t.mu.Unlock()
-	t.handler.Store(&h)
 	t.changed()
 }
 
@@ -146,19 +150,29 @@ func (t *tunnel) start() {
 	go t.loop(ctx, done)
 }
 
-// stop closes the session and waits for the requests in flight, at most a
-// few seconds.
+// stop closes the session and waits for the requests in flight, at most
+// drainTimeout. A stop while another is under way waits for that one.
 func (t *tunnel) stop() {
 	t.mu.Lock()
 	cancel, done := t.cancel, t.done
 	t.cancel = nil
 	t.mu.Unlock()
-	if cancel == nil {
+	if done == nil {
 		return
 	}
-	cancel()
+	if cancel != nil {
+		cancel()
+	}
 	<-done
-	t.set(stOff, "")
+
+	t.mu.Lock()
+	if t.cancel != nil {
+		t.mu.Unlock()
+		return // started again meanwhile: that generation owns the state
+	}
+	t.state, t.lastErr, t.since, t.retries = stOff, "", time.Now(), 0
+	t.mu.Unlock()
+	t.changed()
 }
 
 func (t *tunnel) toggleRoute(prefix string) {
@@ -205,7 +219,13 @@ func (t *tunnel) serve(ctx context.Context) (up bool, err error) {
 	}
 	defer func() { _ = client.Close() }()
 
-	ln, err := client.Listen("tcp", net.JoinHostPort("127.0.0.1", t.conf.RemotePort))
+	var ln net.Listener
+	closeOnCancel := context.AfterFunc(ctx, func() { _ = client.Close() })
+	err = bounded(client, sshTimeout, func() (err error) {
+		ln, err = client.Listen("tcp", net.JoinHostPort("127.0.0.1", t.conf.RemotePort))
+		return err
+	})
+	closeOnCancel()
 	if err != nil {
 		return false, fmt.Errorf("remote listen %s: %w", t.conf.RemotePort, err)
 	}
@@ -214,10 +234,9 @@ func (t *tunnel) serve(ctx context.Context) (up bool, err error) {
 	// ReadHeaderTimeout bounds a client that opens a connection and dribbles
 	// headers forever (Slowloris): the far end of the tunnel is a port open
 	// on the VPS.
-	server := &http.Server{Handler: t, ReadHeaderTimeout: 10 * time.Second}
+	server := &http.Server{Handler: t, ReadHeaderTimeout: readHeaderTimeout}
 	served := make(chan struct{})
-	// #nosec G118 -- ctx is already cancelled when the drain runs; it needs
-	// a deadline of its own.
+	drained := make(chan struct{})
 	go func() {
 		tick := time.NewTicker(keepAliveEvery)
 		defer tick.Stop()
@@ -225,27 +244,82 @@ func (t *tunnel) serve(ctx context.Context) (up bool, err error) {
 			select {
 			case <-served:
 				return
-			case <-ctx.Done():
-				sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				_ = server.Shutdown(sctx)
-				cancel()
-				return
 			case <-tick.C:
+			}
+			err := bounded(client, keepAliveTimeout, func() error {
 				_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
-				if err != nil {
-					_ = client.Close()
-					return
-				}
+				return err
+			})
+			if err != nil {
+				_ = client.Close()
+				return
 			}
 		}
 	}()
-	err = server.Serve(ln)
+	// #nosec G118 -- ctx is already cancelled when the drain runs; it needs
+	// a deadline of its own.
+	go func() {
+		defer close(drained)
+		select {
+		case <-served:
+		case <-ctx.Done():
+			sctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+			_ = server.Shutdown(sctx)
+			cancel()
+		}
+	}()
+	err = server.Serve(pipeListener{ln})
 	close(served)
+	<-drained // Shutdown returns Serve at once; the requests still need the client
 	if errors.Is(err, http.ErrServerClosed) {
 		return true, nil
 	}
 	return true, fmt.Errorf("session lost: %w", err)
 }
+
+// bounded runs fn, a request that waits for the SSH server's reply with no
+// deadline of its own, and closes the client if no reply comes within d: on
+// a link gone silent that is what ends the wait.
+func bounded(client io.Closer, d time.Duration, fn func() error) error {
+	timer := time.AfterFunc(d, func() { _ = client.Close() })
+	err := fn()
+	if !timer.Stop() {
+		return fmt.Errorf("no reply from the SSH server in %v", d)
+	}
+	return err
+}
+
+// pipeListener serves each SSH channel through a net.Pipe. The channel
+// (x/crypto/ssh chanConn) refuses deadlines and net/http needs them: for
+// ReadHeaderTimeout, and to stop its background read when a handler
+// hijacks the connection, without which a WebSocket upgrade hangs.
+type pipeListener struct{ net.Listener }
+
+func (l pipeListener) Accept() (net.Conn, error) {
+	ch, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	inner, outer := net.Pipe()
+	go func() {
+		_, _ = io.Copy(outer, ch)
+		_ = outer.Close()
+	}()
+	go func() {
+		_, _ = io.Copy(ch, outer)
+		_ = ch.Close()
+	}()
+	return pipeConn{Conn: inner, ch: ch}, nil
+}
+
+// pipeConn keeps the channel's addresses: X-Forwarded-For comes from them.
+type pipeConn struct {
+	net.Conn
+	ch net.Conn
+}
+
+func (c pipeConn) LocalAddr() net.Addr  { return c.ch.LocalAddr() }
+func (c pipeConn) RemoteAddr() net.Addr { return c.ch.RemoteAddr() }
 
 // session owns the tunnels of one devmux process and publishes their state
 // in its status file.
@@ -258,6 +332,7 @@ type session struct {
 	wake      chan struct{}
 	quit      chan struct{}
 	closeOnce sync.Once
+	editMu    sync.Mutex             // a route save and a reload, one at a time
 	pubMu     sync.Mutex             // one status write at a time: they share the temp file
 	warning   atomic.Pointer[string] // the screen's next note; run prints instead
 }
@@ -269,6 +344,13 @@ func newSession(mode, config string, confs []tunnelConf, echo bool) *session {
 		s.tunnels = append(s.tunnels, newTunnel(c, s.rec, s.changed))
 	}
 	s.rec.echo = echo
+	dir := s.rec.dir
+	go func() {
+		err := pruneLogs(dir)
+		if err != nil {
+			s.warn(fmt.Errorf("removing old logs: %w", err))
+		}
+	}()
 	return s
 }
 
@@ -286,20 +368,19 @@ func (s *session) changed() {
 }
 
 // saveRoutes writes t's new routes to the config file and, once that
-// worked, gives them to the running tunnel.
-// saveRoutes gives t its new routes and writes them to the config file,
-// putting the old ones back if the file cannot be written. The tunnel goes
-// first so the config watcher finds nothing to reload.
+// worked, gives them to the running tunnel. editMu keeps the config
+// watcher from reloading in between, which would lose a renamed route's
+// on/off state.
 func (s *session) saveRoutes(t *tunnel, routes []route, from, to string) error {
-	old := t.routes()
-	t.setRoutes(routes, from, to)
-	c := t.conf
-	c.Routes = routes
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
+	c := tunnelConf{Name: t.conf.Name, Host: t.conf.Host, RemotePort: t.conf.RemotePort, Routes: routes}
 	err := saveTunnel(s.config, c)
 	if err != nil {
-		t.setRoutes(old, to, from)
+		return err
 	}
-	return err
+	t.setRoutes(routes, from, to)
+	return nil
 }
 
 // watchConfig reloads the routes when the config file changes on disk
@@ -332,6 +413,8 @@ func (s *session) watchConfig() {
 }
 
 func (s *session) reload() {
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
 	confs, err := loadConfig(s.config)
 	if err != nil {
 		s.warn(fmt.Errorf("config changed but does not load, routes kept: %w", err))

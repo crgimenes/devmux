@@ -47,6 +47,10 @@ func runCommand(name string, args []string) int {
 	case "ls":
 		return cmdList(*config, *asJSON)
 	case "requests":
+		if *n < 1 {
+			warnf("requests: -n must be at least 1")
+			return 2
+		}
 		return cmdRequests(*tunnelName, *n, *asJSON)
 	case "request":
 		if fs.NArg() != 1 {
@@ -165,7 +169,8 @@ func cmdList(config string, asJSON bool) int {
 		row := lsRow{tunnelConf: c, State: stOff}
 		for _, p := range statuses {
 			for _, st := range p.Tunnels {
-				if st.Name != c.Name || st.State == stOff {
+				// a name alone could be another config's tunnel
+				if st.Name != c.Name || st.Host != c.Host || st.RemotePort != c.RemotePort || st.State == stOff {
 					continue
 				}
 				row.State, row.Error, row.PID, row.Mode, row.RoutesOff = st.State, st.Error, p.PID, p.Mode, st.Off

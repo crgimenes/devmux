@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -39,27 +41,49 @@ func tunnelForm(src, name string) (start, end int, ok bool) {
 	return 0, 0, false
 }
 
-// formName is NAME when form is (tunnel "NAME" ...), else "".
+// formName is NAME when form is (tunnel NAME ...), NAME a string or a bare
+// number as parseTunnel takes it, else "".
 func formName(form string) string {
 	rest, ok := strings.CutPrefix(form, "(")
 	if !ok {
 		return ""
 	}
-	rest = strings.TrimLeft(rest, " \t\r\n")
-	rest, ok = strings.CutPrefix(rest, "tunnel")
-	if !ok || rest == "" || !strings.ContainsRune(" \t\r\n", rune(rest[0])) {
+	rest, ok = strings.CutPrefix(skipBlank(rest), "tunnel")
+	if !ok || rest == "" || !strings.ContainsRune(" \t\r\n;", rune(rest[0])) {
 		return ""
 	}
-	rest = strings.TrimLeft(rest, " \t\r\n")
-	if !strings.HasPrefix(rest, `"`) {
+	rest = skipBlank(rest)
+	if strings.HasPrefix(rest, `"`) {
+		s, _ := readString(rest)
+		return s
+	}
+	end := strings.IndexAny(rest, " \t\r\n();\"")
+	if end < 0 {
 		return ""
 	}
-	s, _ := readString(rest)
-	return s
+	return rest[:end]
 }
 
-// readString reads the string literal at the start of s: its value and the
-// bytes it spans, quotes included.
+// skipBlank skips whitespace and ; comments.
+func skipBlank(s string) string {
+	for {
+		s = strings.TrimLeft(s, " \t\r\n")
+		if !strings.HasPrefix(s, ";") {
+			return s
+		}
+		nl := strings.IndexByte(s, '\n')
+		if nl < 0 {
+			return ""
+		}
+		s = s[nl+1:]
+	}
+}
+
+// filoEscapes is Filo's string escapes (parser.go in filo), letter to byte.
+var filoEscapes = map[byte]byte{'"': '"', 'n': '\n', 't': '\t', 'r': '\r', '\\': '\\', '0': 0, 'a': '\a', 'b': '\b', 'f': '\f', 'v': '\v'}
+
+// readString reads the string literal at the start of s the way Filo does:
+// its value and the bytes it spans, quotes included.
 func readString(s string) (string, int) {
 	var sb strings.Builder
 	for i := 1; i < len(s); i++ {
@@ -67,7 +91,7 @@ func readString(s string) (string, int) {
 		case '\\':
 			if i+1 < len(s) {
 				i++
-				sb.WriteByte(s[i])
+				sb.WriteByte(filoEscapes[s[i]])
 			}
 		case '"':
 			return sb.String(), i + 1
@@ -79,7 +103,24 @@ func readString(s string) (string, int) {
 }
 
 func quote(s string) string {
-	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`
+	var sb strings.Builder
+	sb.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		esc := byte(0)
+		for letter, b := range filoEscapes {
+			if b == s[i] {
+				esc = letter
+			}
+		}
+		if esc != 0 {
+			sb.WriteByte('\\')
+			sb.WriteByte(esc)
+			continue
+		}
+		sb.WriteByte(s[i])
+	}
+	sb.WriteByte('"')
+	return sb.String()
 }
 
 func formatTunnel(c tunnelConf) string {
@@ -100,43 +141,71 @@ func formatTunnel(c tunnelConf) string {
 // saveTunnel rewrites c's (tunnel ...) form in file and nothing else, then
 // checks that the file still reads back to c before it replaces the old
 // one. Comments inside the form are lost; the rest stays byte for byte.
+// Another writer that got in between makes it start over from their text.
 func saveTunnel(file string, c tunnelConf) error {
 	real, err := filepath.EvalSymlinks(file)
 	if err != nil {
 		return err
 	}
-	info, err := os.Stat(real) // #nosec G703 -- the config file devmux loaded
-	if err != nil {
-		return err
+	for range 5 {
+		b, err := os.ReadFile(filepath.Clean(real)) // #nosec G304 G703 -- the config file devmux loaded
+		if err != nil {
+			return err
+		}
+		out, err := editTunnel(file, string(b), c)
+		if err != nil {
+			return err
+		}
+		again, err := replaceIfUnchanged(real, b, out)
+		if !again {
+			return err
+		}
 	}
-	b, err := os.ReadFile(filepath.Clean(real)) // #nosec G304 G703 -- the config file devmux loaded
-	if err != nil {
-		return err
-	}
-	src := string(b)
+	return fmt.Errorf("%s keeps changing under devmux; try again", file)
+}
+
+// editTunnel is src with c's form rewritten, checked to read back as c.
+func editTunnel(file, src string, c tunnelConf) (string, error) {
 	start, end, ok := tunnelForm(src, c.Name)
 	if !ok {
-		return fmt.Errorf("no (tunnel %q ...) in %s to save into; the old Host/Routes globals are edited by hand", c.Name, file)
+		return "", fmt.Errorf("no (tunnel %q ...) in %s to save into; the old Host/Routes globals are edited by hand", c.Name, file)
 	}
 	out := src[:start] + formatTunnel(c) + src[end:]
-
 	confs, err := parseConfig(file, []byte(out))
 	if err != nil {
-		return fmt.Errorf("the edited config does not load: %w", err)
+		return "", fmt.Errorf("the edited config does not load: %w", err)
 	}
 	i := slices.IndexFunc(confs, func(o tunnelConf) bool { return o.Name == c.Name })
 	if i < 0 || !slices.Equal(confs[i].Routes, c.Routes) {
-		return fmt.Errorf("the edited config does not read back as written")
+		return "", fmt.Errorf("the edited config does not read back as written")
 	}
+	return out, nil
+}
 
-	tmp := real + ".devmux-tmp"
-	err = os.WriteFile(tmp, []byte(out), info.Mode().Perm()) // #nosec G703 -- next to the config file devmux loaded
+// replaceIfUnchanged puts out in place of real, through a fresh temp file
+// beside it (O_EXCL: no symlink or stale file is followed), unless real no
+// longer holds was; then again is true and nothing was written.
+func replaceIfUnchanged(real string, was []byte, out string) (again bool, err error) {
+	info, err := os.Stat(real) // #nosec G703 -- the config file devmux loaded
 	if err != nil {
-		return err
+		return false, err
 	}
-	err = os.Rename(tmp, real) // #nosec G703 -- the config file devmux loaded
+	tmp, err := os.CreateTemp(filepath.Dir(real), "."+filepath.Base(real)+".devmux-*")
 	if err != nil {
-		_ = os.Remove(tmp) // #nosec G703 -- our temp file beside it
+		return false, err
 	}
-	return err
+	defer func() { _ = os.Remove(tmp.Name()) }() // #nosec G703 -- our own temp file
+	_, err = tmp.WriteString(out)
+	err = errors.Join(err, tmp.Chmod(info.Mode().Perm()), tmp.Close())
+	if err != nil {
+		return false, err
+	}
+	now, err := os.ReadFile(filepath.Clean(real)) // #nosec G304 G703 -- the config file devmux loaded
+	if err != nil {
+		return false, err
+	}
+	if !bytes.Equal(now, was) {
+		return true, nil
+	}
+	return false, os.Rename(tmp.Name(), real) // #nosec G703 -- the config file devmux loaded
 }
