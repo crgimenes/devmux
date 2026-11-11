@@ -111,7 +111,7 @@ func (r *recorder) write(ex exchange) error {
 	if r.dir == "" {
 		return nil
 	}
-	err := os.MkdirAll(r.dir, 0700)
+	err := os.MkdirAll(r.dir, 0700) // #nosec G703 -- devmux's state dir
 	if err != nil {
 		return err
 	}
@@ -120,7 +120,7 @@ func (r *recorder) write(ex exchange) error {
 		return err
 	}
 	name := filepath.Join(r.dir, ex.Tunnel+"-"+ex.Time.Format(time.DateOnly)+".jsonl")
-	// #nosec G304 -- dir is devmux's state dir and the tunnel name comes
+	// #nosec G304 G703 -- dir is devmux's state dir and the tunnel name comes
 	// from the config, where check refuses a slash.
 	f, err := os.OpenFile(name, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {

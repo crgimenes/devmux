@@ -86,7 +86,11 @@ func loadConfig(name string) ([]tunnelConf, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseConfig(file, b)
+}
 
+// parseConfig runs the Filo text b; file names it in errors.
+func parseConfig(file string, b []byte) ([]tunnelConf, error) {
 	var tunnels []tunnelConf
 	f := filo.New()
 	defer f.Close()
@@ -95,7 +99,7 @@ func loadConfig(name string) ([]tunnelConf, error) {
 	f.SetGlobal("Host", "")
 	f.SetGlobal("RemotePort", "10000")
 	f.SetGlobal("Routes", map[string]string{})
-	err = f.RegisterBuiltin("tunnel", func(_ context.Context, args []filo.Value) (filo.Value, error) {
+	err := f.RegisterBuiltin("tunnel", func(_ context.Context, args []filo.Value) (filo.Value, error) {
 		t, err := parseTunnel(args)
 		if err != nil {
 			return filo.VBool(false), err
@@ -201,6 +205,18 @@ func (t *tunnelConf) check() error {
 		if err != nil {
 			return fmt.Errorf("tunnel %s: route %s: %w", t.Name, r.Prefix, err)
 		}
+	}
+	return nil
+}
+
+// checkPrefix is what a route added from the screen or the CLI may be:
+// letters, digits and - . _ ~ / , with no empty segment.
+func checkPrefix(p string) error {
+	bad := strings.ContainsFunc(p, func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && !strings.ContainsRune("-._~/", r)
+	})
+	if p == "" || bad || strings.Contains(p, "//") {
+		return fmt.Errorf("a prefix is letters, digits and - . _ ~ /")
 	}
 	return nil
 }

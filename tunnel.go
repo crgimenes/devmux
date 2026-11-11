@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +23,7 @@ const (
 const (
 	keepAliveEvery = 30 * time.Second
 	retryMax       = 30 * time.Second
+	configPoll     = 2 * time.Second
 )
 
 type tunnelStatus struct {
@@ -38,8 +41,9 @@ type tunnelStatus struct {
 // loopback and serves the routes there. Once started it reconnects on its
 // own until stopped.
 type tunnel struct {
-	conf    tunnelConf
-	handler http.Handler
+	conf    tunnelConf // Routes changes under mu, from setRoutes
+	rec     *recorder
+	handler atomic.Pointer[http.Handler]
 	changed func()
 
 	mu      sync.Mutex
@@ -53,9 +57,41 @@ type tunnel struct {
 }
 
 func newTunnel(c tunnelConf, rec *recorder, changed func()) *tunnel {
-	t := &tunnel{conf: c, changed: changed, state: stOff, since: time.Now(), off: map[string]bool{}}
-	t.handler = newRouter(c, t.routeOn, rec)
+	t := &tunnel{conf: c, rec: rec, changed: changed, state: stOff, since: time.Now(), off: map[string]bool{}}
+	h := newRouter(c, t.routeOn, rec)
+	t.handler.Store(&h)
 	return t
+}
+
+func (t *tunnel) routes() []route {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return slices.Clone(t.conf.Routes)
+}
+
+// setRoutes swaps the routes of a running tunnel: requests already in a
+// proxy finish there, the next ones see the new table. from and to carry a
+// renamed route's on/off state over ("" when nothing was renamed).
+func (t *tunnel) setRoutes(routes []route, from, to string) {
+	t.mu.Lock()
+	t.conf.Routes = slices.Clone(routes)
+	if from != "" && from != to {
+		t.off[to] = t.off[from]
+		delete(t.off, from)
+	}
+	for p := range t.off {
+		if !slices.ContainsFunc(routes, func(r route) bool { return r.Prefix == p }) {
+			delete(t.off, p)
+		}
+	}
+	h := newRouter(t.conf, t.routeOn, t.rec)
+	t.mu.Unlock()
+	t.handler.Store(&h)
+	t.changed()
+}
+
+func (t *tunnel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	(*t.handler.Load()).ServeHTTP(w, r)
 }
 
 func (t *tunnel) status() tunnelStatus {
@@ -178,7 +214,7 @@ func (t *tunnel) serve(ctx context.Context) (up bool, err error) {
 	// ReadHeaderTimeout bounds a client that opens a connection and dribbles
 	// headers forever (Slowloris): the far end of the tunnel is a port open
 	// on the VPS.
-	server := &http.Server{Handler: t.handler, ReadHeaderTimeout: 10 * time.Second}
+	server := &http.Server{Handler: t, ReadHeaderTimeout: 10 * time.Second}
 	served := make(chan struct{})
 	// #nosec G118 -- ctx is already cancelled when the drain runs; it needs
 	// a deadline of its own.
@@ -214,18 +250,20 @@ func (t *tunnel) serve(ctx context.Context) (up bool, err error) {
 // session owns the tunnels of one devmux process and publishes their state
 // in its status file.
 type session struct {
-	mode    string
-	config  string
-	started time.Time
-	tunnels []*tunnel
-	rec     *recorder
-	wake    chan struct{}
-	pubMu   sync.Mutex             // one status write at a time: they share the temp file
-	warning atomic.Pointer[string] // the screen's next note; run prints instead
+	mode      string
+	config    string
+	started   time.Time
+	tunnels   []*tunnel
+	rec       *recorder
+	wake      chan struct{}
+	quit      chan struct{}
+	closeOnce sync.Once
+	pubMu     sync.Mutex             // one status write at a time: they share the temp file
+	warning   atomic.Pointer[string] // the screen's next note; run prints instead
 }
 
 func newSession(mode, config string, confs []tunnelConf, echo bool) *session {
-	s := &session{mode: mode, config: config, started: time.Now(), wake: make(chan struct{}, 1)}
+	s := &session{mode: mode, config: config, started: time.Now(), wake: make(chan struct{}, 1), quit: make(chan struct{})}
 	s.rec = &recorder{dir: logsDir(), wake: s.notify, fail: s.warn}
 	for _, c := range confs {
 		s.tunnels = append(s.tunnels, newTunnel(c, s.rec, s.changed))
@@ -245,6 +283,68 @@ func (s *session) notify() {
 func (s *session) changed() {
 	s.publish()
 	s.notify()
+}
+
+// saveRoutes writes t's new routes to the config file and, once that
+// worked, gives them to the running tunnel.
+// saveRoutes gives t its new routes and writes them to the config file,
+// putting the old ones back if the file cannot be written. The tunnel goes
+// first so the config watcher finds nothing to reload.
+func (s *session) saveRoutes(t *tunnel, routes []route, from, to string) error {
+	old := t.routes()
+	t.setRoutes(routes, from, to)
+	c := t.conf
+	c.Routes = routes
+	err := saveTunnel(s.config, c)
+	if err != nil {
+		t.setRoutes(old, to, from)
+	}
+	return err
+}
+
+// watchConfig reloads the routes when the config file changes on disk
+// (devmux route, another devmux, an editor), until close. Tunnels added or
+// removed there need a restart.
+func (s *session) watchConfig() {
+	stamp := func() string {
+		info, err := os.Stat(s.config) // #nosec G703 -- the config file this devmux loaded
+		if err != nil {
+			return ""
+		}
+		return fmt.Sprint(info.ModTime().UnixNano(), info.Size())
+	}
+	last := stamp()
+	tick := time.NewTicker(configPoll)
+	defer tick.Stop()
+	for {
+		select {
+		case <-s.quit:
+			return
+		case <-tick.C:
+		}
+		now := stamp()
+		if now == last || now == "" {
+			continue
+		}
+		last = now
+		s.reload()
+	}
+}
+
+func (s *session) reload() {
+	confs, err := loadConfig(s.config)
+	if err != nil {
+		s.warn(fmt.Errorf("config changed but does not load, routes kept: %w", err))
+		return
+	}
+	for _, t := range s.tunnels {
+		i := slices.IndexFunc(confs, func(c tunnelConf) bool { return c.Name == t.conf.Name })
+		if i < 0 || slices.Equal(confs[i].Routes, t.routes()) {
+			continue
+		}
+		t.setRoutes(confs[i].Routes, "", "")
+		s.warn(fmt.Errorf("config changed: routes of %s reloaded", t.conf.Name))
+	}
 }
 
 func (s *session) publish() {
@@ -274,6 +374,7 @@ func (s *session) warn(err error) {
 
 // close stops every tunnel at once and removes the status file.
 func (s *session) close() {
+	s.closeOnce.Do(func() { close(s.quit) })
 	var wg sync.WaitGroup
 	for _, t := range s.tunnels {
 		wg.Go(t.stop)

@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -67,6 +68,7 @@ func cmdScreen(config string) int {
 	}
 	s := newSession("screen", configFile(config), confs, false)
 	a := &app{t: t, c: screen.New(t.Size()), s: s}
+	go s.watchConfig()
 	a.push(&tunnelsView{})
 
 	// kill or a closed window would otherwise leave the shell in raw mode
@@ -196,10 +198,10 @@ func (v *tunnelsView) draw(a *app, c *screen.Canvas, top, left, rows, cols int) 
 	for i, t := range ts {
 		st := t.status()
 		text, pen := stateText(st)
-		cells[i] = []string{st.Name, st.Host + ":" + st.RemotePort, routesText(t.conf, st.Off), text}
+		cells[i] = []string{st.Name, st.Host + ":" + st.RemotePort, routesText(t.routes(), st.Off), text}
 		pens[i] = pen
 	}
-	tcols := kit.FillCols([]kit.Col{{Header: "tunnel", Width: 12}, {Header: "remote", Width: 22}, {Header: "routes", Width: 24}, {Header: "state"}}, cols)
+	tcols := fitCols([]kit.Col{{Header: "tunnel", Width: 16}, {Header: "remote", Width: 28}, {Header: "routes"}, {Header: "state", Width: 28}}, cells, 2, cols)
 	v.tab.Draw(c, top, left, tcols, len(ts), func(i int) []string { return cells[i] }, rows-2)
 	// the state column in its own colour, unless the row is under the cursor
 	at := left
@@ -216,9 +218,30 @@ func (v *tunnelsView) draw(a *app, c *screen.Canvas, top, left, rows, cols int) 
 	}
 }
 
-func routesText(c tunnelConf, off []string) string {
+// fitCols narrows each column but fill to its widest cell (header
+// included, Width as the ceiling) and gives fill what the line has left, so
+// the table spans the screen.
+func fitCols(cols []kit.Col, cells [][]string, fill, inner int) []kit.Col {
+	out := slices.Clone(cols)
+	used := len(out) - 1 // the gaps
+	for j := range out {
+		if j == fill {
+			continue
+		}
+		w := screen.Width(out[j].Header)
+		for _, row := range cells {
+			w = max(w, screen.Width(row[j]))
+		}
+		out[j].Width = min(w, out[j].Width)
+		used += out[j].Width
+	}
+	out[fill].Width = max(4, inner-used)
+	return out
+}
+
+func routesText(routes []route, off []string) string {
 	var parts []string
-	for _, r := range c.Routes {
+	for _, r := range routes {
 		var p strings.Builder
 		p.WriteString(r.Prefix + "→" + r.Port)
 		for _, o := range off {
@@ -263,8 +286,9 @@ func (v *tunnelsView) key(a *app, k screen.Key) {
 // routesView lists one tunnel's routes, each one switchable, with whether
 // something listens on its local port.
 type routesView struct {
-	t   *tunnel
-	tab kit.Table
+	t        *tunnel
+	tab      kit.Table
+	deleting string // the prefix asked about; the next key answers
 
 	mu      sync.Mutex
 	probed  time.Time
@@ -275,7 +299,7 @@ type routesView struct {
 func (v *routesView) title() string { return "devmux · " + v.t.conf.Name + " · routes" }
 
 func (v *routesView) hints() []kit.Hint {
-	return []kit.Hint{{Key: "space", What: "on/off"}, {Key: "r", What: "requests"}, {Key: "esc", What: "back"}}
+	return []kit.Hint{{Key: "space", What: "on/off"}, {Key: "a", What: "add"}, {Key: "e", What: "edit"}, {Key: "d", What: "delete"}, {Key: "r", What: "requests"}, {Key: "esc", What: "back"}}
 }
 
 // probe dials each local port off the event loop, at most every 2 s.
@@ -289,7 +313,7 @@ func (v *routesView) probe(wake func()) {
 	v.mu.Unlock()
 	go func() {
 		open := map[string]bool{}
-		for _, r := range v.t.conf.Routes {
+		for _, r := range v.t.routes() {
 			conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", r.Port), 300*time.Millisecond)
 			if err == nil {
 				_ = conn.Close()
@@ -313,7 +337,7 @@ func (v *routesView) draw(a *app, c *screen.Canvas, top, left, rows, cols int) {
 	v.mu.Lock()
 	open, probed := v.open, !v.probed.IsZero()
 	v.mu.Unlock()
-	routes := v.t.conf.Routes
+	routes := v.t.routes()
 	tcols := kit.FillCols([]kit.Col{{Header: "prefix", Width: 16}, {Header: "local", Width: 16}, {Header: "route", Width: 6}, {Header: "listening"}}, cols)
 	v.tab.Draw(c, top+2, left, tcols, len(routes), func(i int) []string {
 		r := routes[i]
@@ -333,14 +357,45 @@ func (v *routesView) draw(a *app, c *screen.Canvas, top, left, rows, cols int) {
 }
 
 func (v *routesView) key(a *app, k screen.Key) {
-	routes := v.t.conf.Routes
+	routes := v.t.routes()
+	if v.deleting != "" {
+		prefix := v.deleting
+		v.deleting = ""
+		if k != 'y' {
+			a.say(kit.Plain, "kept /%s", prefix)
+			return
+		}
+		rest := slices.DeleteFunc(routes, func(r route) bool { return r.Prefix == prefix })
+		err := a.s.saveRoutes(v.t, rest, "", "")
+		if err != nil {
+			a.say(kit.Err, "%v", err)
+			return
+		}
+		a.say(kit.OK, "deleted /%s", prefix)
+		return
+	}
 	if v.tab.Move(k, len(routes), 5) {
 		return
 	}
+	var cur *route
+	if len(routes) > 0 {
+		cur = &routes[min(v.tab.Cursor, len(routes)-1)]
+	}
 	switch k {
 	case ' ':
-		if len(routes) > 0 {
-			v.t.toggleRoute(routes[v.tab.Cursor].Prefix)
+		if cur != nil {
+			v.t.toggleRoute(cur.Prefix)
+		}
+	case 'a':
+		a.push(newRouteForm(v.t, nil))
+	case 'e', screen.KeyEnter:
+		if cur != nil {
+			a.push(newRouteForm(v.t, cur))
+		}
+	case 'd', screen.KeyDel:
+		if cur != nil {
+			v.deleting = cur.Prefix
+			a.say(kit.Warn, "delete /%s → %s from the config? y deletes, any other key keeps it", cur.Prefix, cur.Port)
 		}
 	case 'r':
 		a.push(&requestsView{tunnel: v.t.conf.Name})
@@ -483,4 +538,98 @@ func (v *detailView) key(a *app, k screen.Key) {
 		a.pop()
 	}
 	v.first = max(0, v.first)
+}
+
+// routeForm adds a route to a tunnel or edits one; Save writes the config
+// file and hands the routes to the running tunnel.
+type routeForm struct {
+	t    *tunnel
+	was  *route // nil adds
+	form *kit.Form
+}
+
+const (
+	fieldPrefix = iota
+	fieldPort
+)
+
+func newRouteForm(t *tunnel, r *route) *routeForm {
+	f := &routeForm{t: t}
+	prefix, port := "", ""
+	if r != nil {
+		was := *r
+		f.was = &was
+		prefix, port = r.Prefix, r.Port
+	}
+	f.form = kit.NewForm([]kit.Field{
+		{Kind: kit.TextField, Label: "prefix", Width: 32, Max: 200, Value: prefix},
+		{Kind: kit.TextField, Label: "port", Width: 7, Max: 5, Value: port},
+	}, "Save", "Cancel")
+	return f
+}
+
+func (f *routeForm) title() string {
+	if f.was == nil {
+		return "devmux · " + f.t.conf.Name + " · new route"
+	}
+	return "devmux · " + f.t.conf.Name + " · route /" + f.was.Prefix
+}
+
+func (f *routeForm) hints() []kit.Hint {
+	return []kit.Hint{{Key: "↑↓", What: "field"}, {Key: "ctrl-w", What: "save"}, {Key: "esc", What: "cancel"}}
+}
+
+func (f *routeForm) draw(_ *app, c *screen.Canvas, top, left, _, _ int) {
+	c.Print(top, left, "/PREFIX/... goes to 127.0.0.1:PORT/..., the prefix stripped; the longest prefix wins.", kit.Dim)
+	f.form.Draw(c, top+2, left, 6)
+}
+
+func (f *routeForm) key(a *app, k screen.Key) {
+	switch f.form.Key(k) {
+	case "save":
+		f.save(a)
+	case kit.Cancel: // ESC, or the Cancel button
+		a.pop()
+	}
+}
+
+func (f *routeForm) save(a *app) {
+	prefix := strings.Trim(strings.TrimSpace(f.form.Value(fieldPrefix)), "/")
+	port := strings.TrimSpace(f.form.Value(fieldPort))
+	err := checkPrefix(prefix)
+	if err != nil {
+		f.form.Fail(fieldPrefix, err.Error())
+		return
+	}
+	if checkPort(port) != nil {
+		f.form.Fail(fieldPort, "a port is 1 to 65535")
+		return
+	}
+
+	routes := f.t.routes()
+	from := ""
+	if f.was != nil {
+		from = f.was.Prefix
+	}
+	for _, r := range routes {
+		if r.Prefix == prefix && r.Prefix != from {
+			f.form.Fail(fieldPrefix, "/"+prefix+" is already a route")
+			return
+		}
+	}
+	nr := route{Prefix: prefix, Port: port}
+	i := slices.IndexFunc(routes, func(r route) bool { return f.was != nil && r.Prefix == from })
+	if i < 0 {
+		routes = append(routes, nr)
+	} else {
+		routes[i] = nr
+	}
+
+	err = a.s.saveRoutes(f.t, routes, from, prefix)
+	if err != nil {
+		f.form.Note = err.Error()
+		return
+	}
+	a.pop()
+	a.say(kit.OK, "saved /%s → %s", prefix, port)
 }

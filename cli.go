@@ -54,6 +54,8 @@ func runCommand(name string, args []string) int {
 			return 2
 		}
 		return cmdRequest(fs.Arg(0), *asJSON)
+	case "route":
+		return cmdRoute(*config, fs.Args())
 	case "help":
 		printUsage()
 		return 0
@@ -104,6 +106,7 @@ func cmdRun(config string, names []string) int {
 	defer signal.Stop(sig)
 
 	last := map[string]string{}
+	go s.watchConfig()
 	for _, t := range s.tunnels {
 		t.start()
 	}
@@ -175,16 +178,12 @@ func cmdList(config string, asJSON bool) int {
 		return printJSON(rows)
 	}
 	for _, r := range rows {
-		var routes []string
-		for _, rt := range r.Routes {
-			routes = append(routes, rt.Prefix+"="+rt.Port)
-		}
 		pidText := ""
 		if r.PID != 0 {
 			pidText = fmt.Sprintf("%d(%s)", r.PID, r.Mode)
 		}
 		fmt.Printf("%s;%s;%s;%s;%s;%s;%s\n",
-			r.Name, r.Host, r.RemotePort, r.State, pidText, strings.Join(routes, ","), strings.Join(r.RoutesOff, ","))
+			r.Name, r.Host, r.RemotePort, r.State, pidText, routeList(r.Routes), strings.Join(r.RoutesOff, ","))
 	}
 	return 0
 }
@@ -242,4 +241,61 @@ func printJSON(v any) int {
 		return 1
 	}
 	return 0
+}
+
+// cmdRoute adds or removes one route in the config file; a devmux already
+// running picks it up within configPoll.
+func cmdRoute(config string, args []string) int {
+	if len(args) == 0 || len(args) != map[string]int{"add": 4, "rm": 3}[args[0]] {
+		warnf("route: want add TUNNEL PREFIX PORT or rm TUNNEL PREFIX (devmux -h)")
+		return 2
+	}
+	confs, ok := loadOrWarn(config)
+	if !ok {
+		return 2
+	}
+	op, name, prefix := args[0], args[1], strings.Trim(args[2], "/")
+	i := slices.IndexFunc(confs, func(c tunnelConf) bool { return c.Name == name })
+	if i < 0 {
+		warnf("no tunnel %q in the config", name)
+		return 2
+	}
+	c := confs[i]
+	j := slices.IndexFunc(c.Routes, func(r route) bool { return r.Prefix == prefix })
+
+	if op == "add" {
+		port := args[3]
+		err := errors.Join(checkPrefix(prefix), checkPort(port))
+		if err != nil {
+			warnf("route add: %v", err)
+			return 2
+		}
+		if j >= 0 {
+			warnf("route add: /%s is already a route of %s, to port %s; rm it first", prefix, name, c.Routes[j].Port)
+			return 1
+		}
+		c.Routes = append(c.Routes, route{Prefix: prefix, Port: port})
+	} else {
+		if j < 0 {
+			warnf("route rm: %s has no route /%s", name, prefix)
+			return 1
+		}
+		c.Routes = slices.Delete(c.Routes, j, j+1)
+	}
+
+	err := saveTunnel(configFile(config), c)
+	if err != nil {
+		warnf("route %s: %v", op, err)
+		return 1
+	}
+	fmt.Println(routeList(c.Routes))
+	return 0
+}
+
+func routeList(routes []route) string {
+	var out []string
+	for _, r := range routes {
+		out = append(out, r.Prefix+"="+r.Port)
+	}
+	return strings.Join(out, ",")
 }

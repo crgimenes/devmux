@@ -69,9 +69,14 @@ ssh-agent or an `IdentityFile`.
 | Screen | Keys |
 |---|---|
 | tunnels | space on/off, enter routes, r requests, q quit |
-| routes of a tunnel | space switches the route (an off route answers 503), r requests; shows whether something listens on each local port |
+| routes of a tunnel | space switches the route (an off route answers 503), a adds, e or enter edits, d deletes (y confirms), r requests; shows whether something listens on each local port |
 | requests | newest first, live; enter opens one |
 | request | headers and bodies, ↑↓ PgUp PgDn to scroll; esc goes back |
+
+Adding, editing and deleting a route writes the config file at once and
+takes effect on the running tunnel. Only that tunnel's `(tunnel ...)` form is
+rewritten, so comments inside it are lost; the rest of the file stays as it
+was. A config in the older `Host`/`Routes` form is edited by hand.
 
 Quitting closes the tunnels, waiting a few seconds for requests in flight.
 
@@ -81,8 +86,14 @@ Quitting closes the tunnels, waiting a few seconds for requests in flight.
 devmux ls [-json]                         tunnels, and which are up in which process
 devmux requests [-tunnel N] [-n 20] [-json]
 devmux request [-json] ID
+devmux route add TUNNEL PREFIX PORT       add a route to the config file
+devmux route rm TUNNEL PREFIX             remove one
 devmux run [NAME...]                      all tunnels, or those named; requests on stdout
 ```
+
+A running devmux (screen or `run`) checks the config file every 2 s and
+reloads the routes when it changes, whether by `devmux route`, another
+devmux or an editor. Tunnels added or removed in the file need a restart.
 
 Every request is appended as one JSON line to
 `~/.local/state/devmux/logs/<tunnel>-<date>.jsonl` (`$XDG_STATE_HOME` is

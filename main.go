@@ -31,6 +31,8 @@ Commands:
   requests [-tunnel N] [-n 20] [-json]
                                 latest requests, newest first
   request [-json] ID            one request and its response, in full
+  route add TUNNEL PREFIX PORT  add a route to the config file
+  route rm TUNNEL PREFIX        remove one; a running devmux reloads within 2 s
 
 Every command takes -config FILE. Config: ./devmux_init.filo, else
 %s

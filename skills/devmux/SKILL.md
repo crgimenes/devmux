@@ -19,6 +19,8 @@ devmux ls [-json]                        name;host;remote_port;state;pid(mode);r
 devmux requests [-tunnel N] [-n 20] [-json]
                                          id;time;tunnel;method;url;status;ms, newest first
 devmux request [-json] ID                one request and its response, in full
+devmux route add TUNNEL PREFIX PORT      add a route to the config file
+devmux route rm TUNNEL PREFIX            remove one
 devmux run [NAME...]                     serve tunnels with no screen (blocks)
 ```
 
@@ -42,8 +44,15 @@ arguments. Exit 0 success, 1 failure (message on stderr, `devmux: ...`),
   (503). Status 502 means the local service did not answer.
 - The logs keep everything, headers included: `Authorization`, cookies
   and tokens are there. Quote only what the task needs, never a secret.
-- You cannot switch a tunnel or route held by the user's screen; ask the
-  user to do it there (space on the tunnel or route).
+- You cannot switch a tunnel or route on or off in the user's screen; ask
+  the user to do it there (space on the tunnel or route).
+- **`route add` and `route rm` change the user's config file and, within
+  2 s, every running devmux** (the screen included): a new route exposes
+  that local port to the remote host. Run them only when the user asked for
+  that route in this conversation, and say what you changed. They print the
+  tunnel's routes after the change (`prefix=port,...`). `add` refuses a
+  prefix that exists (exit 1): `rm` first to change its port. A config in
+  the old `Host`/`Routes` form cannot be edited this way (exit 1).
 - **`devmux run` exposes local ports to the remote host. Start it only
   when the user asked for that tunnel in this conversation**; run it in the
   background and stop it (SIGINT) when done. Two processes cannot open the
