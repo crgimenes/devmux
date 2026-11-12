@@ -13,6 +13,9 @@ import (
 	"syscall"
 )
 
+// maxRequests bounds `requests -n`: what it holds, and 2n must not overflow.
+const maxRequests = 100000
+
 // runCommand returns the exit status: 0 done, 1 failed, 2 used wrong.
 func runCommand(name string, args []string) int {
 	fs := flag.NewFlagSet("devmux "+name, flag.ContinueOnError)
@@ -47,8 +50,8 @@ func runCommand(name string, args []string) int {
 	case "ls":
 		return cmdList(*config, *asJSON)
 	case "requests":
-		if *n < 1 {
-			warnf("requests: -n must be at least 1")
+		if *n < 1 || *n > maxRequests {
+			warnf("requests: -n goes from 1 to %d", maxRequests)
 			return 2
 		}
 		return cmdRequests(*tunnelName, *n, *asJSON)
@@ -265,9 +268,7 @@ func cmdRoute(config string, args []string) int {
 		warnf("no tunnel %q in the config", name)
 		return 2
 	}
-	c := confs[i]
-	j := slices.IndexFunc(c.Routes, func(r route) bool { return r.Prefix == prefix })
-
+	edit := dropRoute(prefix)
 	if op == "add" {
 		port := args[3]
 		err := errors.Join(checkPrefix(prefix), checkPort(port))
@@ -275,25 +276,15 @@ func cmdRoute(config string, args []string) int {
 			warnf("route add: %v", err)
 			return 2
 		}
-		if j >= 0 {
-			warnf("route add: /%s is already a route of %s, to port %s; rm it first", prefix, name, c.Routes[j].Port)
-			return 1
-		}
-		c.Routes = append(c.Routes, route{Prefix: prefix, Port: port})
-	} else {
-		if j < 0 {
-			warnf("route rm: %s has no route /%s", name, prefix)
-			return 1
-		}
-		c.Routes = slices.Delete(c.Routes, j, j+1)
+		edit = putRoute("", route{Prefix: prefix, Port: port})
 	}
 
-	err := saveTunnel(configFile(config), c)
+	routes, err := editRoutes(configFile(config), name, edit)
 	if err != nil {
 		warnf("route %s: %v", op, err)
 		return 1
 	}
-	fmt.Println(routeList(c.Routes))
+	fmt.Println(routeList(routes))
 	return 0
 }
 

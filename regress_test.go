@@ -50,7 +50,9 @@ func serveLikeTunnel(t *testing.T, h http.Handler, headerTimeout time.Duration) 
 		t.Fatal(err)
 	}
 	srv := &http.Server{Handler: h, ReadHeaderTimeout: headerTimeout}
-	go func() { _ = srv.Serve(pipeListener{noDeadlineListener{ln}}) }()
+	go func() {
+		_ = srv.Serve(pipeListener{Listener: noDeadlineListener{ln}, slots: make(chan struct{}, maxConns)})
+	}()
 	t.Cleanup(func() { _ = srv.Close() })
 	return ln.Addr().String()
 }
@@ -222,7 +224,7 @@ func TestFailedDeleteKeepsRouteOff(t *testing.T) {
 	s := newSession("screen", name, confs, false)
 	tn := s.tunnels[0]
 	tn.toggleRoute("x")
-	err = s.saveRoutes(tn, []route{{"y", "2"}}, "", "")
+	err = s.editRoutes(tn, dropRoute("x"), "", "")
 	if err == nil {
 		t.Fatal("saved into a legacy config")
 	}
@@ -502,4 +504,175 @@ func portOf(t *testing.T, s *httptest.Server) string {
 		t.Fatal(err)
 	}
 	return port
+}
+
+// Second round (Codex, 2026-11-11), numbered R2-n.
+
+// R2-1
+func TestStalledBodyIsCut(t *testing.T) {
+	old := bodyIdle
+	bodyIdle = 300 * time.Millisecond
+	defer func() { bodyIdle = old }()
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+	}))
+	defer backend.Close()
+	front := httptest.NewServer(newRouter(tunnelConf{Name: "t", Routes: []route{{"up", portOf(t, backend)}}}, on, &recorder{}))
+	defer front.Close()
+	conn, err := net.Dial("tcp", front.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_, _ = fmt.Fprint(conn, "POST /up HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\nab")
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	start := time.Now()
+	_, _ = io.ReadAll(conn)
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("a stalled body held the connection %v", d)
+	}
+}
+
+// R2-1
+func TestPipeListenerCapsConnections(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pl := pipeListener{Listener: ln, slots: make(chan struct{}, 1)}
+	defer func() { _ = pl.Close() }()
+	go func() {
+		for {
+			c, err := pl.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _, _ = io.Copy(io.Discard, c) }() // held open, never closed
+		}
+	}()
+	first, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = first.Close() }()
+	time.Sleep(100 * time.Millisecond)
+	second, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = second.Close() }()
+	_ = second.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err = second.Read(make([]byte, 1))
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("over the cap: %v, want the connection closed", err)
+	}
+}
+
+// R2-5
+func TestStaleGenerationCannotReport(t *testing.T) {
+	tn := newTunnel(tunnelConf{Name: "t"}, &recorder{}, func() {})
+	tn.mu.Lock()
+	tn.cancel, tn.gen, tn.state = func() {}, 2, stUp
+	tn.mu.Unlock()
+	tn.report(1, stConnecting, "")
+	if tn.status().State != stUp {
+		t.Fatalf("generation 1 overwrote generation 2: %s", tn.status().State)
+	}
+}
+
+// R2-6, R2-7
+func TestConcurrentRouteEditsAllLand(t *testing.T) {
+	name := writeConfig(t, editSample)
+	var wg sync.WaitGroup
+	for i := range 20 {
+		wg.Go(func() {
+			_, err := editRoutes(name, "a", putRoute("", route{fmt.Sprint("r", i), "1"}))
+			if err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	wg.Wait()
+	confs, err := loadConfig(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(confs[0].Routes) != 21 || len(confs[1].Routes) != 1 {
+		t.Fatalf("a has %d routes, want 21; b %v", len(confs[0].Routes), confs[1].Routes)
+	}
+}
+
+// R2-7
+func TestScreenEditBuildsOnTheFile(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	name := writeConfig(t, editSample)
+	confs, _ := loadConfig(name)
+	s := newSession("screen", name, confs, false)
+	if runCommand("route", []string{"-config", name, "add", "a", "y", "2"}) != 0 {
+		t.Fatal("cli add")
+	}
+	err := s.editRoutes(s.tunnels[0], putRoute("", route{"z", "3"}), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _ := loadConfig(name)
+	if len(c[0].Routes) != 3 || len(s.tunnels[0].routes()) != 3 {
+		t.Fatalf("file %v, tunnel %v: the CLI's y was lost", c[0].Routes, s.tunnels[0].routes())
+	}
+}
+
+// R2-10
+func TestEncodedPrefix(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, r.RequestURI) }))
+	defer backend.Close()
+	front := httptest.NewServer(newRouter(tunnelConf{Name: "t", Routes: []route{{"api", portOf(t, backend)}, {"a/b", portOf(t, backend)}}}, on, &recorder{}))
+	defer front.Close()
+	for path, want := range map[string]string{
+		"/%61pi/files/a%2Fb?q=1": "/files/a%2Fb?q=1",
+		"/a%2Fb/x%2Fy":           "/x%2Fy",
+		"/a/b/c":                 "/c",
+	} {
+		resp, err := http.Get(front.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if string(b) != want {
+			t.Errorf("%s: backend got %q, want %q", path, b, want)
+		}
+	}
+}
+
+// R2-11
+func TestRecentByStartTime(t *testing.T) {
+	dir := t.TempDir()
+	rec := &recorder{dir: dir}
+	now := time.Now()
+	rec.add(exchange{Time: now.Add(time.Second), Tunnel: "a", URL: "/B-newer-finished-first"})
+	rec.add(exchange{Time: now, Tunnel: "a", URL: "/A-older-finished-last"})
+	got, _ := recentExchanges(dir, "", 1)
+	if len(got) != 1 || got[0].URL != "/B-newer-finished-first" {
+		t.Errorf("got %v", got)
+	}
+}
+
+// R2-12
+func TestRefusedKeepsBody(t *testing.T) {
+	rec := &recorder{}
+	h := newRouter(tunnelConf{Name: "t", Routes: []route{{"a", "1"}}}, on, rec)
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/nope", strings.NewReader("payload")))
+	l := rec.list("")
+	if string(l[0].ReqBody) != "payload" || l[0].Status != http.StatusNotFound || !strings.Contains(string(l[0].RespBody), "no route") {
+		t.Errorf("refused request recorded as %+v", l[0])
+	}
+}
+
+// R2-14
+func TestRequestsRefusesHugeN(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	(&recorder{dir: logsDir()}).add(exchange{Time: time.Now(), Tunnel: "a"})
+	if code := runCommand("requests", []string{"-n", "9223372036854775807"}); code != 2 {
+		t.Errorf("exit %d, want 2", code)
+	}
 }

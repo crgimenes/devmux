@@ -37,7 +37,7 @@ func TestSaveTunnelKeepsTheRest(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := tunnelConf{Name: "b", Host: "host-b", RemotePort: "10001", Routes: []route{{"y", "2"}, {"api/v1", "3001"}}}
-	err = saveTunnel(name, c)
+	_, err = editRoutes(name, c.Name, setRoutesTo(c.Routes))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestSaveTunnelKeepsTheRest(t *testing.T) {
 	}
 
 	c.Routes = nil
-	err = saveTunnel(name, c)
+	_, err = editRoutes(name, c.Name, setRoutesTo(c.Routes))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func TestSaveTunnelKeepsTheRest(t *testing.T) {
 	}
 
 	legacy := writeConfig(t, `(set Host "vps") (set Routes (list (tuple "w" "80")))`)
-	err = saveTunnel(legacy, tunnelConf{Name: "vps", Host: "vps", RemotePort: "10000"})
+	_, err = editRoutes(legacy, "vps", setRoutesTo(nil))
 	if err == nil {
 		t.Error("saved into a config with no (tunnel ...) form")
 	}
@@ -211,4 +211,8 @@ func TestSessionReloadsRoutes(t *testing.T) {
 	if w == nil || !strings.Contains(*w, "routes of b reloaded") {
 		t.Errorf("no note about the reload: %v", w)
 	}
+}
+
+func setRoutesTo(rs []route) func([]route) ([]route, error) {
+	return func([]route) ([]route, error) { return rs, nil }
 }

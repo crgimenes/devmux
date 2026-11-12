@@ -138,30 +138,88 @@ func formatTunnel(c tunnelConf) string {
 	return sb.String()
 }
 
-// saveTunnel rewrites c's (tunnel ...) form in file and nothing else, then
-// checks that the file still reads back to c before it replaces the old
-// one. Comments inside the form are lost; the rest stays byte for byte.
-// Another writer that got in between makes it start over from their text.
-func saveTunnel(file string, c tunnelConf) error {
+// editRoutes changes the routes of tunnel name in file: edit gets the
+// routes the file holds now, under a lock every devmux takes, so a change
+// another process made since this one read the file is built on, not
+// undone. Only that tunnel's (tunnel ...) form is rewritten; comments
+// inside it are lost, the rest stays byte for byte. It returns the routes
+// written.
+func editRoutes(file, name string, edit func([]route) ([]route, error)) ([]route, error) {
 	real, err := filepath.EvalSymlinks(file)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	unlock, err := lockFile(filepath.Join(filepath.Dir(real), "."+filepath.Base(real)+".devmux-lock"))
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	// An editor does not take the lock: if the file changes between the
+	// read and the rename, start over from what it holds then.
 	for range 5 {
 		b, err := os.ReadFile(filepath.Clean(real)) // #nosec G304 G703 -- the config file devmux loaded
 		if err != nil {
-			return err
+			return nil, err
+		}
+		confs, err := parseConfig(file, b)
+		if err != nil {
+			return nil, fmt.Errorf("the config does not load: %w", err)
+		}
+		i := slices.IndexFunc(confs, func(o tunnelConf) bool { return o.Name == name })
+		if i < 0 {
+			return nil, fmt.Errorf("no tunnel %q in %s", name, file)
+		}
+		c := confs[i]
+		c.Routes, err = edit(slices.Clone(c.Routes))
+		if err != nil {
+			return nil, err
+		}
+		err = c.check()
+		if err != nil {
+			return nil, err
 		}
 		out, err := editTunnel(file, string(b), c)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		again, err := replaceIfUnchanged(real, b, out)
 		if !again {
-			return err
+			return c.Routes, err
 		}
 	}
-	return fmt.Errorf("%s keeps changing under devmux; try again", file)
+	return nil, fmt.Errorf("%s keeps changing under devmux; try again", file)
+}
+
+// putRoute is the edit that sets r, in place of the route from ("" adds
+// it). A prefix another route already has is refused.
+func putRoute(from string, r route) func([]route) ([]route, error) {
+	return func(rs []route) ([]route, error) {
+		for _, o := range rs {
+			if o.Prefix == r.Prefix && o.Prefix != from {
+				return nil, fmt.Errorf("/%s is already a route, to port %s", r.Prefix, o.Port)
+			}
+		}
+		if from == "" {
+			return append(rs, r), nil
+		}
+		i := slices.IndexFunc(rs, func(o route) bool { return o.Prefix == from })
+		if i < 0 {
+			return nil, fmt.Errorf("/%s is no longer in the config", from)
+		}
+		rs[i] = r
+		return rs, nil
+	}
+}
+
+// dropRoute is the edit that removes the route prefix.
+func dropRoute(prefix string) func([]route) ([]route, error) {
+	return func(rs []route) ([]route, error) {
+		i := slices.IndexFunc(rs, func(o route) bool { return o.Prefix == prefix })
+		if i < 0 {
+			return nil, fmt.Errorf("no route /%s", prefix)
+		}
+		return slices.Delete(rs, i, i+1), nil
+	}
 }
 
 // editTunnel is src with c's form rewritten, checked to read back as c.

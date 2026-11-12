@@ -28,6 +28,10 @@ const (
 	configPoll        = 2 * time.Second
 	readHeaderTimeout = 10 * time.Second
 	drainTimeout      = 5 * time.Second
+	idleTimeout       = 2 * time.Minute
+	maxHeaderBytes    = 64 << 10
+	maxConns          = 256 // per tunnel: what one remote client can hold open
+	pruneEvery        = time.Hour
 )
 
 type tunnelStatus struct {
@@ -58,6 +62,7 @@ type tunnel struct {
 	off     map[string]bool
 	cancel  context.CancelFunc
 	done    chan struct{}
+	gen     int // the generation whose loop may report state; start bumps it
 }
 
 func newTunnel(c tunnelConf, rec *recorder, changed func()) *tunnel {
@@ -118,8 +123,14 @@ func (t *tunnel) status() tunnelStatus {
 	return st
 }
 
-func (t *tunnel) set(state, errText string) {
+// report is a loop's word on the state; one from a generation that was
+// stopped (and maybe started again) is dropped.
+func (t *tunnel) report(gen int, state, errText string) {
 	t.mu.Lock()
+	if gen != t.gen || t.cancel == nil {
+		t.mu.Unlock()
+		return
+	}
 	t.state, t.lastErr, t.since = state, errText, time.Now()
 	if state == stRetry {
 		t.retries++
@@ -145,9 +156,10 @@ func (t *tunnel) start() {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.cancel, t.done = cancel, make(chan struct{})
-	done := t.done
+	t.gen++
+	done, gen := t.done, t.gen
 	t.mu.Unlock()
-	go t.loop(ctx, done)
+	go t.loop(ctx, done, gen)
 }
 
 // stop closes the session and waits for the requests in flight, at most
@@ -188,19 +200,19 @@ func (t *tunnel) routeOn(prefix string) bool {
 	return !t.off[prefix]
 }
 
-func (t *tunnel) loop(ctx context.Context, done chan struct{}) {
+func (t *tunnel) loop(ctx context.Context, done chan struct{}, gen int) {
 	defer close(done)
 	wait := time.Second
 	for {
-		t.set(stConnecting, "")
-		up, err := t.serve(ctx)
+		t.report(gen, stConnecting, "")
+		up, err := t.serve(ctx, gen)
 		if ctx.Err() != nil {
 			return
 		}
 		if up {
 			wait = time.Second
 		}
-		t.set(stRetry, err.Error())
+		t.report(gen, stRetry, err.Error())
 		select {
 		case <-ctx.Done():
 			return
@@ -212,7 +224,7 @@ func (t *tunnel) loop(ctx context.Context, done chan struct{}) {
 
 // serve holds one SSH session until it breaks or ctx ends; up says the
 // remote port was opened, which resets the backoff.
-func (t *tunnel) serve(ctx context.Context) (up bool, err error) {
+func (t *tunnel) serve(ctx context.Context, gen int) (up bool, err error) {
 	client, err := dialSSH(ctx, t.conf.Host)
 	if err != nil {
 		return false, err
@@ -229,12 +241,18 @@ func (t *tunnel) serve(ctx context.Context) (up bool, err error) {
 	if err != nil {
 		return false, fmt.Errorf("remote listen %s: %w", t.conf.RemotePort, err)
 	}
-	t.set(stUp, "")
+	t.report(gen, stUp, "")
 
-	// ReadHeaderTimeout bounds a client that opens a connection and dribbles
-	// headers forever (Slowloris): the far end of the tunnel is a port open
-	// on the VPS.
-	server := &http.Server{Handler: t, ReadHeaderTimeout: readHeaderTimeout}
+	// The far end of the tunnel is a port open on the VPS: ReadHeaderTimeout
+	// bounds a client that dribbles headers (Slowloris), MaxHeaderBytes what
+	// each request keeps in the ring, maxConns how many it can hold open;
+	// a stalled body is cut by bodyTap.
+	server := &http.Server{
+		Handler:           t,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}
 	served := make(chan struct{})
 	drained := make(chan struct{})
 	go func() {
@@ -263,14 +281,22 @@ func (t *tunnel) serve(ctx context.Context) (up bool, err error) {
 		select {
 		case <-served:
 		case <-ctx.Done():
+			// Shutdown first closes the remote listener, which waits for the
+			// SSH server's reply: on a silent link the client is closed at
+			// the drain deadline, which ends that wait.
+			timer := time.AfterFunc(drainTimeout, func() { _ = client.Close() })
 			sctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
 			_ = server.Shutdown(sctx)
 			cancel()
+			timer.Stop()
 		}
 	}()
-	err = server.Serve(pipeListener{ln})
+	err = server.Serve(pipeListener{Listener: ln, slots: make(chan struct{}, maxConns)})
 	close(served)
 	<-drained // Shutdown returns Serve at once; the requests still need the client
+	// Whatever outlived the drain (a body stalled against a backend that
+	// stopped reading) is cut, pipes included: nothing outlives serve.
+	_ = server.Close()
 	if errors.Is(err, http.ErrServerClosed) {
 		return true, nil
 	}
@@ -293,13 +319,28 @@ func bounded(client io.Closer, d time.Duration, fn func() error) error {
 // (x/crypto/ssh chanConn) refuses deadlines and net/http needs them: for
 // ReadHeaderTimeout, and to stop its background read when a handler
 // hijacks the connection, without which a WebSocket upgrade hangs.
-type pipeListener struct{ net.Listener }
+// Past maxConns open at once, a new channel is closed at once.
+type pipeListener struct {
+	net.Listener
+	slots chan struct{}
+}
 
 func (l pipeListener) Accept() (net.Conn, error) {
-	ch, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
+	for {
+		ch, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		select {
+		case l.slots <- struct{}{}:
+			return l.pipe(ch), nil
+		default:
+			_ = ch.Close()
+		}
 	}
+}
+
+func (l pipeListener) pipe(ch net.Conn) net.Conn {
 	inner, outer := net.Pipe()
 	go func() {
 		_, _ = io.Copy(outer, ch)
@@ -308,8 +349,9 @@ func (l pipeListener) Accept() (net.Conn, error) {
 	go func() {
 		_, _ = io.Copy(ch, outer)
 		_ = ch.Close()
+		<-l.slots
 	}()
-	return pipeConn{Conn: inner, ch: ch}, nil
+	return pipeConn{Conn: inner, ch: ch}
 }
 
 // pipeConn keeps the channel's addresses: X-Forwarded-For comes from them.
@@ -344,14 +386,26 @@ func newSession(mode, config string, confs []tunnelConf, echo bool) *session {
 		s.tunnels = append(s.tunnels, newTunnel(c, s.rec, s.changed))
 	}
 	s.rec.echo = echo
-	dir := s.rec.dir
-	go func() {
+	go s.pruneLoop(s.rec.dir)
+	return s
+}
+
+// pruneLoop removes old logs now and every pruneEvery until close: a devmux
+// left running for weeks must not keep them all.
+func (s *session) pruneLoop(dir string) {
+	tick := time.NewTicker(pruneEvery)
+	defer tick.Stop()
+	for {
 		err := pruneLogs(dir)
 		if err != nil {
 			s.warn(fmt.Errorf("removing old logs: %w", err))
 		}
-	}()
-	return s
+		select {
+		case <-s.quit:
+			return
+		case <-tick.C:
+		}
+	}
 }
 
 // notify wakes whoever draws; a wake already pending covers this one.
@@ -367,15 +421,14 @@ func (s *session) changed() {
 	s.notify()
 }
 
-// saveRoutes writes t's new routes to the config file and, once that
-// worked, gives them to the running tunnel. editMu keeps the config
+// editRoutes applies edit to t's routes in the config file and, once that
+// worked, gives the result to the running tunnel. editMu keeps the config
 // watcher from reloading in between, which would lose a renamed route's
 // on/off state.
-func (s *session) saveRoutes(t *tunnel, routes []route, from, to string) error {
+func (s *session) editRoutes(t *tunnel, edit func([]route) ([]route, error), from, to string) error {
 	s.editMu.Lock()
 	defer s.editMu.Unlock()
-	c := tunnelConf{Name: t.conf.Name, Host: t.conf.Host, RemotePort: t.conf.RemotePort, Routes: routes}
-	err := saveTunnel(s.config, c)
+	routes, err := editRoutes(s.config, t.conf.Name, edit)
 	if err != nil {
 		return err
 	}

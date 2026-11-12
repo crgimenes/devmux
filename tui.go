@@ -73,36 +73,39 @@ func cmdScreen(config string) int {
 	a.push(&tunnelsView{})
 
 	// kill or a closed window would otherwise leave the shell in raw mode
-	// on the alternate screen, and the tunnels open.
+	// on the alternate screen, and the tunnels open. The event loop takes
+	// the signal, so nothing paints on a terminal already given back.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGHUP, os.Interrupt)
 	defer signal.Stop(sig)
-	go func() {
-		got := <-sig
-		_ = t.Close()
-		s.close()
-		warnf("%v", got)
-		os.Exit(1)
-	}()
 
-	a.run()
-	a.say(kit.Wait, "closing tunnels")
-	a.paint()
-	s.close()
+	got := a.run(sig)
+	if got == nil {
+		a.say(kit.Wait, "closing tunnels")
+		a.paint()
+	}
 	_ = t.Close()
+	s.close()
+	if got != nil {
+		warnf("%v", got)
+		return 1
+	}
 	return 0
 }
 
-func (a *app) run() {
+// run is the event loop until quit; a signal ends it too, and is returned.
+func (a *app) run(sig <-chan os.Signal) os.Signal {
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	events := a.t.Events()
 	for !a.quit {
 		a.paint()
 		select {
+		case got := <-sig:
+			return got
 		case ev, ok := <-events:
 			if !ok {
-				return
+				return nil
 			}
 			if !ev.Resize {
 				a.handle(ev.Key)
@@ -112,6 +115,7 @@ func (a *app) run() {
 			kit.Spin++
 		}
 	}
+	return nil
 }
 
 func (a *app) handle(k screen.Key) {
@@ -366,8 +370,7 @@ func (v *routesView) key(a *app, k screen.Key) {
 			a.say(kit.Plain, "kept /%s", prefix)
 			return
 		}
-		rest := slices.DeleteFunc(routes, func(r route) bool { return r.Prefix == prefix })
-		err := a.s.saveRoutes(v.t, rest, "", "")
+		err := a.s.editRoutes(v.t, dropRoute(prefix), "", "")
 		if err != nil {
 			a.say(kit.Err, "%v", err)
 			return
@@ -609,28 +612,13 @@ func (f *routeForm) save(a *app) {
 		return
 	}
 
-	routes := f.t.routes()
 	from := ""
 	if f.was != nil {
 		from = f.was.Prefix
 	}
-	for _, r := range routes {
-		if r.Prefix == prefix && r.Prefix != from {
-			f.form.Fail(fieldPrefix, "/"+prefix+" is already a route")
-			return
-		}
-	}
-	nr := route{Prefix: prefix, Port: port}
-	i := slices.IndexFunc(routes, func(r route) bool { return f.was != nil && r.Prefix == from })
-	if i < 0 {
-		routes = append(routes, nr)
-	} else {
-		routes[i] = nr
-	}
-
-	err = a.s.saveRoutes(f.t, routes, from, prefix)
+	err = a.s.editRoutes(f.t, putRoute(from, route{Prefix: prefix, Port: port}), from, prefix)
 	if err != nil {
-		f.form.Note = err.Error()
+		f.form.Fail(fieldPrefix, err.Error())
 		return
 	}
 	a.pop()

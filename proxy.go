@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +28,14 @@ const (
 	colorCyan   = "\033[36m"
 )
 
+// transport is the default one with response headers capped well under
+// what readLog takes in one line.
+var transport = func() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxResponseHeaderBytes = 1 << 20
+	return t
+}()
+
 // maxLoggedBody caps what is kept of each body for the log; the proxied
 // stream itself is never truncated.
 const maxLoggedBody = 64 << 10
@@ -37,9 +46,13 @@ type loggingResponseWriter struct {
 	size       int
 	body       bytes.Buffer
 	truncated  bool
+	tap        *bodyTap // its body deadline ends when the response starts
 }
 
 func (lw *loggingResponseWriter) WriteHeader(code int) {
+	if lw.tap != nil {
+		lw.tap.stopIdle()
+	}
 	lw.statusCode = code
 	lw.ResponseWriter.WriteHeader(code)
 }
@@ -70,19 +83,54 @@ func (lw *loggingResponseWriter) Unwrap() http.ResponseWriter {
 	return lw.ResponseWriter
 }
 
+// bodyIdle is how long a request body may go without a byte before the
+// connection is cut: a client that sends headers and then nothing would
+// otherwise hold a connection here and one to the backend for good.
+var bodyIdle = time.Minute // a var so a test can make it short
+
 // bodyTap keeps the first maxLoggedBody bytes of the request body as the
 // proxy reads them, so nothing is held back from the backend. The
-// transport may still be reading when the handler returns: mu.
+// transport may still be reading when the handler returns: mu, and done
+// stops it from touching rc (the handler's) after that.
 type bodyTap struct {
 	io.ReadCloser
+	rc        *http.ResponseController
+	abort     context.CancelFunc // ends the backend call when the body fails
 	mu        sync.Mutex
+	done      bool
+	idleOff   bool
+	failed    bool
 	kept      bytes.Buffer
 	truncated bool
 	err       error
 }
 
+func newBodyTap(w http.ResponseWriter, body io.ReadCloser) *bodyTap {
+	return &bodyTap{ReadCloser: body, rc: http.NewResponseController(w)}
+}
+
 func (b *bodyTap) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	if !b.done && !b.idleOff {
+		_ = b.rc.SetReadDeadline(time.Now().Add(bodyIdle))
+	}
+	b.mu.Unlock()
 	n, err := b.ReadCloser.Read(p)
+	switch {
+	case errors.Is(err, io.EOF):
+		b.stopIdle() // a deadline left on the connection would cut a long response
+	case err != nil:
+		// The deadline stays: closing the body reads what is left of it,
+		// and the connection is no good any more. The transport would wait
+		// for a backend that waits for the rest of this body; cancelling
+		// ends both.
+		b.mu.Lock()
+		b.failed = true
+		b.mu.Unlock()
+		if b.abort != nil {
+			b.abort()
+		}
+	}
 	b.mu.Lock()
 	keep := min(n, maxLoggedBody-b.kept.Len())
 	b.truncated = b.truncated || keep < n
@@ -94,9 +142,25 @@ func (b *bodyTap) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// stopIdle drops the body deadline: at the body's end, and once the
+// response starts (a backend may answer without reading it all).
+func (b *bodyTap) stopIdle() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.done && !b.idleOff && !b.failed {
+		b.idleOff = true
+		_ = b.rc.SetReadDeadline(time.Time{})
+	}
+}
+
+// result is what was kept; the handler is returning, so rc is let go.
 func (b *bodyTap) result() (body []byte, truncated bool, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if !b.done && !b.idleOff && !b.failed {
+		_ = b.rc.SetReadDeadline(time.Time{}) // the next request on the connection
+	}
+	b.done = true
 	return bytes.Clone(b.kept.Bytes()), b.truncated, b.err
 }
 
@@ -111,6 +175,7 @@ func newRouter(c tunnelConf, on func(prefix string) bool, rec *recorder) http.Ha
 		target := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", rt.Port)}
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		proxy.ErrorLog = log.New(io.Discard, "", 0)
+		proxy.Transport = transport
 		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 			http.Error(w, "devmux: "+err.Error(), http.StatusBadGateway)
 		}
@@ -136,18 +201,34 @@ func newRouter(c tunnelConf, on func(prefix string) bool, rec *recorder) http.Ha
 	})
 }
 
+// refuse answers a request no route takes, recorded whole: a webhook
+// sent to the wrong path is the one most worth reading.
 func refuse(w http.ResponseWriter, r *http.Request, tunnel, prefix string, status int, why string, rec *recorder) {
-	http.Error(w, "devmux: "+why, status)
+	start := time.Now()
+	tap := newBodyTap(w, r.Body)
+	_, _ = io.Copy(io.Discard, io.LimitReader(tap, maxLoggedBody+1))
+	lw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+	http.Error(lw, "devmux: "+why, status)
+	body, truncated, err := tap.result()
+	if err != nil {
+		why += "; reading the request body: " + err.Error()
+	}
 	rec.add(exchange{
-		Time:      time.Now(),
-		Tunnel:    tunnel,
-		Route:     prefix,
-		Method:    r.Method,
-		Host:      r.Host,
-		URL:       r.URL.String(),
-		ReqHeader: r.Header,
-		Status:    status,
-		Note:      why,
+		Time:         start,
+		Tunnel:       tunnel,
+		Route:        prefix,
+		Method:       r.Method,
+		Host:         r.Host,
+		URL:          r.URL.String(),
+		ReqHeader:    r.Header,
+		ReqBody:      body,
+		ReqTruncated: truncated,
+		Status:       lw.statusCode,
+		Size:         lw.size,
+		MS:           float64(time.Since(start).Microseconds()) / 1000,
+		RespHeader:   lw.Header().Clone(),
+		RespBody:     bytes.Clone(lw.body.Bytes()),
+		Note:         why,
 	})
 }
 
@@ -165,10 +246,14 @@ func recording(tunnel, prefix, target string, next http.Handler, rec *recorder) 
 			URL:       r.URL.String(),
 			ReqHeader: r.Header.Clone(),
 		}
-		tap := &bodyTap{ReadCloser: r.Body}
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		r = r.WithContext(ctx)
+		tap := newBodyTap(w, r.Body)
+		tap.abort = cancel
 		r.Body = tap
 		stripPrefix(r.URL, prefix)
-		lw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		lw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK, tap: tap}
 
 		// ReverseProxy panics with http.ErrAbortHandler when the response
 		// breaks halfway; the request still reached the backend, so it is
@@ -201,12 +286,28 @@ func recording(tunnel, prefix, target string, next http.Handler, rec *recorder) 
 // stripPrefix takes "/"+prefix off the path. The escaped form is cut too, so
 // a %2F the client sent reaches the backend as %2F, not as a separator.
 func stripPrefix(u *url.URL, prefix string) {
-	raw := u.RawPath
+	esc := u.EscapedPath()
 	u.Path = withSlash(strings.TrimPrefix(u.Path, "/"+prefix))
 	u.RawPath = ""
-	rest, ok := strings.CutPrefix(raw, "/"+prefix)
-	if raw != "" && ok {
-		u.RawPath = withSlash(rest) // url.URL drops it if it stops matching Path
+	// The route matched the decoded path; in the escaped one, cut the
+	// segments that decode to the prefix (/%61pi is /api), whatever their
+	// spelling, and keep the rest as the client wrote it.
+	segs := strings.SplitN(strings.TrimPrefix(esc, "/"), "/", strings.Count(prefix, "/")+2)
+	var dec []string
+	for i, s := range segs {
+		d, err := url.PathUnescape(s)
+		if err != nil {
+			return
+		}
+		dec = append(dec, d)
+		joined := strings.Join(dec, "/")
+		if joined == prefix {
+			u.RawPath = withSlash(strings.Join(segs[i+1:], "/")) // url.URL drops it if it does not match Path
+			return
+		}
+		if !strings.HasPrefix(prefix, joined+"/") {
+			return
+		}
 	}
 }
 

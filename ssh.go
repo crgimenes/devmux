@@ -79,6 +79,9 @@ func dialSSH(ctx context.Context, alias string) (*ssh.Client, error) {
 		return nil, fmt.Errorf("auth: %w", err)
 	}
 	defer closeAgent()
+	// a stop while the agent is being asked must not wait for it
+	stopAgent := context.AfterFunc(ctx, closeAgent)
+	defer stopAgent()
 
 	cfg := &ssh.ClientConfig{
 		User:              user,
@@ -143,8 +146,11 @@ func agentAuth(sshKeyPath string) (ssh.AuthMethod, func(), error) {
 	if sock != "" {
 		// #nosec G704 -- sock is the ssh-agent socket from the user's own
 		// environment, not a network address taken from any request.
-		conn, err := net.Dial("unix", sock)
+		conn, err := net.DialTimeout("unix", sock, sshTimeout)
 		if err == nil {
+			// an agent that never answers (a locked keychain prompt, a
+			// wedged forwarder) fails the attempt instead of hanging it
+			_ = conn.SetDeadline(time.Now().Add(sshTimeout))
 			return ssh.PublicKeysCallback(agent.NewClient(conn).Signers), func() { _ = conn.Close() }, nil
 		}
 	}

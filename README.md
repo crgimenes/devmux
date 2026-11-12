@@ -102,6 +102,12 @@ devmux writes its tunnels' state to `~/.local/state/devmux/run/<pid>.json`,
 which `devmux ls` reads. Bodies are kept up to 64 KiB in the log; what goes
 to the service is never cut.
 
+The remote port is reachable by anyone who reaches the remote web server,
+so devmux bounds what a client can cost: headers up to 64 KiB, at most 256
+open connections per tunnel, a request body that stalls for a minute is
+cut, logs stop at 256 MiB per tunnel per day and are removed after 14
+days.
+
 For Claude Code, link the skill:
 
 ```bash

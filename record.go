@@ -246,27 +246,31 @@ func recentExchanges(dir, tunnel string, n int) ([]exchange, error) {
 		if tunnel != "" && !strings.HasPrefix(fi.Name(), tunnel+"-") {
 			continue
 		}
-		// A file is in time order: only its last n lines can count, so no
-		// more than 2n are held however big the file is.
-		var tail []exchange
+		// Lines go in as requests end, but Time is when they began: keep
+		// the n newest by Time, holding at most 2n however big the file.
 		err = readLog(filepath.Join(dir, fi.Name()), func(ex exchange) bool {
 			if tunnel != "" && ex.Tunnel != tunnel {
 				return true
 			}
-			tail = append(tail, ex)
-			if len(tail) >= 2*n {
-				tail = slices.Clone(tail[len(tail)-n:])
+			got = append(got, ex)
+			if len(got) >= 2*n {
+				got = newest(got, n)
 			}
 			return true
 		})
 		if err != nil {
 			return nil, err
 		}
-		got = append(got, tail[max(0, len(tail)-n):]...)
-		slices.SortFunc(got, func(a, b exchange) int { return b.Time.Compare(a.Time) })
-		got = slices.Clone(got[:min(len(got), n)])
+		got = newest(got, n)
 	}
 	return got, nil
+}
+
+// newest is the n exchanges of es with the latest Time, newest first, in a
+// slice of their own so the rest can be freed.
+func newest(es []exchange, n int) []exchange {
+	slices.SortFunc(es, func(a, b exchange) int { return b.Time.Compare(a.Time) })
+	return slices.Clone(es[:min(len(es), n)])
 }
 
 func findExchange(dir, id string) (exchange, error) {
