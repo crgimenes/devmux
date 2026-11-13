@@ -164,6 +164,9 @@ func agentAuth(sshKeyPath string) (ssh.AuthMethod, func(), error) {
 		return nil, nil, err
 	}
 	signer, err := ssh.ParsePrivateKey(key)
+	if _, ok := errors.AsType[*ssh.PassphraseMissingError](err); ok {
+		return nil, nil, fmt.Errorf("%s is passphrase protected and no ssh-agent holds it: run ssh-add %s", sshKeyPath, sshKeyPath)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse %s: %w", sshKeyPath, err)
 	}
